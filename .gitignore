@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.uv/
+dist/
+build/
+
+.pytest_cache/
+.ruff_cache/
+
+state/
+spikes/output/
+*.log
+
+.idea/
+.vscode/
+.claude/
+
+# stray scratch files
+/probe.txt
