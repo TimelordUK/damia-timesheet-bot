@@ -85,3 +85,23 @@ class ApprovalRecord:
     approver_email: str
     approved_at: datetime
     approval_png_path: Path
+
+
+@dataclass
+class WeekRecord:
+    """One row of portal-truth cache, keyed by `week_start`. This is the authoritative
+    facet rebuilt by hydrating from the Damia portal — distinct from the email-side
+    `Submission`/tracking-id world, which overlays onto this on `week_start`.
+
+    `status` is Damia's own status word ('Approved', 'Submitted', 'Draft', 'Rejected').
+    `day_units` is Sun..Sat. `pdf_path` / `attachment_paths` point into the cache."""
+    week_start: date
+    week_end: date
+    status: str
+    total_units: float
+    worked_days: int
+    day_units: tuple[float, ...]
+    portal_timesheet_id: int | None = None
+    pdf_path: Path | None = None
+    attachment_paths: list[Path] = field(default_factory=list)
+    hydrated_at: datetime | None = None

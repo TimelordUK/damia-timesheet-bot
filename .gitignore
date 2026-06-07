@@ -9,8 +9,11 @@ build/
 .pytest_cache/
 .ruff_cache/
 
-state/
+# dev-override data root only — NOT the adapters/state package
+/state/
+/state-dev/
 spikes/output/
+scratch/
 *.log
 
 .idea/
