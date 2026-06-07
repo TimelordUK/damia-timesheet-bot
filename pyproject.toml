@@ -8,6 +8,7 @@ dependencies = [
     "requests>=2.32",
     "textual>=0.83",
     "pywin32>=308 ; sys_platform == 'win32'",
+    "pyyaml>=6.0.3",
 ]
 
 [project.optional-dependencies]
@@ -17,7 +18,7 @@ dev = [
 ]
 
 [project.scripts]
-damia-bot = "damia_timesheet_bot.tui.app:main"
+damia-bot = "damia_timesheet_bot.cli:main"
 
 [build-system]
 requires = ["hatchling"]

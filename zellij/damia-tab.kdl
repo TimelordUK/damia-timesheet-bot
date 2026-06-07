@@ -1,0 +1,58 @@
+// Damia bot — a NEW-TAB layout (not a full session layout). Mirrors the structure of the
+// user's real session layout (tab-bar / main / status-bar / floating_panes; start_suspended).
+//
+// Add it to a RUNNING zellij session (keeps your default layout + plugins intact):
+//     zellij action new-tab --layout zellij/damia-tab.kdl --name damia
+// or run  scripts/damia-tab.ps1  from inside zellij.
+//
+// A `new-tab --layout` does NOT inherit your new_tab_template, so this tab declares the
+// tab-bar (size=1) and status-bar (size=1) plugin panes itself — without them the tab
+// renders bare and you lose the navigation chrome.
+//
+// Main (tiled) pane = the Textual TUI, runs immediately, reads
+//   %LOCALAPPDATA%\damia-timesheet-bot\cache\view.json
+// Floating panes are start_suspended (press Enter in a pane to fire it); hidden by default
+// like your other tabs — toggle with your floating-panes keybind:
+//   * chrome-cdp : Chrome with the CDP debug port + dedicated profile + Damia (the 136+ quirk)
+//   * hydrator   : `damia-bot hydrate` — walk the portal, rebuild cache + view.json, then
+//                  press `r` in the TUI to reload
+//   * email-agent: placeholder shell for the future Outlook approval probe (draft-only)
+layout {
+    cwd "C:\\Users\\sjame\\dev\\damia-timesheet-bot"
+    tab name="damia" focus=true hide_floating_panes=true {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        pane name="timesheet" command="uv" {
+            args "run" "damia-bot" "tui"
+        }
+        pane size=1 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+        floating_panes {
+            pane name="chrome-cdp" command="C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" {
+                start_suspended true
+                height 32
+                width 84
+                x 42
+                y 17
+                args "--remote-debugging-port=9222" "--user-data-dir=C:\\Users\\sjame\\AppData\\Local\\damia-timesheet-bot\\chrome-profile" "https://damia.timesheetportal.com/"
+            }
+            pane name="hydrator" command="uv" {
+                start_suspended true
+                height 14
+                width 84
+                x 42
+                y 2
+                args "run" "damia-bot" "hydrate"
+            }
+            pane name="email-agent" command="C:\\Program Files\\PowerShell\\7\\pwsh.EXE" {
+                start_suspended true
+                height 10
+                width 84
+                x 42
+                y 50
+            }
+        }
+    }
+}

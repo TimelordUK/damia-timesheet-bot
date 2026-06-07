@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from .models import (
@@ -20,12 +21,29 @@ class HolidayProvider(Protocol):
 
 @runtime_checkable
 class TimesheetDriver(Protocol):
-    """Drives the timesheet portal. Read-and-fill, never submits."""
+    """Drives the timesheet portal. Read-and-fill, never submits.
 
+    Beyond fill, the driver exposes a read-only history surface used by the hydrator to
+    back-walk the job and archive each week. A different timesheet system plugs in by
+    implementing the same methods."""
+
+    # fill surface
     def navigate_to_week(self, week_start: date) -> None: ...
     def read_week(self) -> Week: ...
     def fill_week(self, week: Week) -> None: ...
     def screenshot_week(self) -> bytes: ...
+
+    # history / back-walk surface (used by hydrate())
+    def navigate_to_current_week(self) -> None: ...
+    def current_week_range(self) -> tuple[date, date]: ...
+    def status_word(self) -> str: ...
+    def has_download_button(self) -> bool: ...
+    def step_to_prev_week(self) -> bool:
+        """Step back one week. Return False if refused (before the job's first week)."""
+        ...
+
+    def download_week_pdf(self, save_to: "Path") -> "Path": ...
+    def pull_attachments(self, save_dir: "Path") -> list["Path"]: ...
 
 
 @runtime_checkable
