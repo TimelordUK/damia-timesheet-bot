@@ -30,6 +30,9 @@ SEL_STATUS_SPAN      = "[class*='timesheetStatus']"
 # Affirm/decline in a jQuery UI confirm dialog. Text varies; class is the stable signal.
 SEL_CONFIRM_AFFIRM   = ".ui-dialog-buttonpane button.is-success"
 SEL_CONFIRM_DECLINE  = ".ui-dialog-buttonpane button.is-danger"
+# Any button in a currently-visible jQuery UI dialog. Used to close the "not a valid
+# period for this job" alert Damia raises when you try to step before the contract start.
+SEL_DIALOG_ANY_BUTTON = ".ui-dialog:visible .ui-dialog-buttonpane button"
 
 # Selectors that ARE parameterized by the per-week Damia timesheet ID (an integer that
 # Damia embeds in every form-element id for a given timesheet). The driver discovers
@@ -43,6 +46,8 @@ FMT_BTN_SUBMIT        = "#MainContent_tblSubmit_{tid}_pnlApproverFooter_btnSubmi
 FMT_WEEK_TOTAL        = "#lblTotalDaysForWeek_{tid}"
 FMT_DAY_SELECT        = "#ctlEnd_{tid}_{day}_0"
 FMT_DAILY_TOTAL       = "#pnlDailyDaysDetail_{tid}_{day}"
+FMT_BTN_ATTACH_TAB    = "#btnShowAttachmentsPanel_{tid}"  # onclick=showAttachmentPanel(tid)
+FMT_ATTACH_WRAPPER    = "#tsAttachmentWrapper_{tid}"
 
 DAMIA_VALUES = ("1.00", "0.75", "0.50", "0.25", "0.00")
 STATUS_CLASS_RE  = re.compile(r"timesheetStatus(\w+)")
@@ -306,8 +311,20 @@ class DamiaTimesheetDriver:
 
     # ---- navigate ---------------------------------------------------------
 
+    def _click_postback_div(self, selector: str, timeout: int = 5000) -> None:
+        """Click an ASP.NET __doPostBack div. These nav controls are <div onclick=...>
+        and Damia hides some of them depending on state (e.g. the current-week button is
+        hidden when you're already on the current week). A normal Playwright click waits
+        for visibility and times out on those; falling back to the element's own DOM
+        click() fires the onclick/__doPostBack regardless of visibility."""
+        loc = self.page.locator(selector)
+        try:
+            loc.click(timeout=timeout)
+        except Exception:
+            loc.evaluate("el => el.click()")
+
     def navigate_to_current_week(self) -> None:
-        self.page.locator(SEL_BTN_CURRENT_WEEK).click(timeout=5000)
+        self._click_postback_div(SEL_BTN_CURRENT_WEEK)
         self._wait_for_postback()
         self._refresh_timesheet_id()
 
@@ -335,6 +352,34 @@ class DamiaTimesheetDriver:
             self.page.locator(SEL_CONFIRM_AFFIRM).click(timeout=500)
         except Exception:
             pass
+
+    def _dismiss_period_dialog_if_present(self) -> None:
+        """Close any visible jQuery UI dialog by clicking its (single) button. Damia raises
+        a 'not a valid period for this job' alert when you step before the contract start;
+        dismissing it leaves the page on the unchanged week."""
+        try:
+            btns = self.page.locator(SEL_DIALOG_ANY_BUTTON)
+            if btns.count() > 0:
+                btns.first.click(timeout=1000)
+        except Exception:
+            pass
+
+    def step_to_prev_week(self) -> bool:
+        """Click the previous-week button once. Returns True if the week actually moved,
+        False if Damia refused — it shows a modal ('not a valid period for this job') and
+        stays put when you try to step before the contract start. On a refusal we dismiss
+        the dialog and leave the page on the same (earliest) week. The unchanged-range
+        check is the authoritative stop signal for the back-walk, independent of the
+        dialog's exact markup."""
+        before, _ = self.current_week_range()
+        self.page.locator(SEL_BTN_PREV_WEEK).click(timeout=5000)
+        self._wait_for_postback()
+        after, _ = self.current_week_range()
+        if after == before:
+            self._dismiss_period_dialog_if_present()
+            return False
+        self._refresh_timesheet_id()
+        return True
 
     # ---- mutate -----------------------------------------------------------
 
@@ -459,6 +504,82 @@ class DamiaTimesheetDriver:
             }""",
             tid,
         )
+
+    def open_attachments_tab(self) -> None:
+        """Show the Attachments panel. The tab is a div whose onclick calls
+        showAttachmentPanel(tid); fire it via DOM click() (it may be hidden)."""
+        self.page.locator(self._sel(FMT_BTN_ATTACH_TAB)).evaluate("el => el.click()")
+        self.page.wait_for_timeout(800)
+
+    def attachment_urls(self) -> list[str]:
+        """Distinct signed-CDN URLs for files attached to the current week. Damia renders
+        each attachment as an inline <img src> pointing at
+        download-lb-*.timesheetportal.com/.../private/...?key=<JWT> (signed, expiring).
+        We filter on '/private/' + 'key=' so UI icons don't get picked up."""
+        tid = self.timesheet_id
+        return self.page.evaluate(
+            """(tid) => {
+              const wrap = document.querySelector(`#tsAttachmentWrapper_${tid}`);
+              if (!wrap) return [];
+              const seen = new Set(), out = [];
+              for (const img of wrap.querySelectorAll('img[src]')) {
+                const s = img.getAttribute('src') || '';
+                if (s.includes('/private/') && s.includes('key=') && !seen.has(s)) {
+                  seen.add(s); out.push(s);
+                }
+              }
+              return out;
+            }""",
+            tid,
+        )
+
+    @staticmethod
+    def _sniff_ext(body: bytes) -> str:
+        """Pick a file extension from the actual bytes — Damia serves JPEGs from URLs ending
+        '..png' with an unreliable content-type, so we trust the magic number, not the header."""
+        if body[:3] == b"\xff\xd8\xff":
+            return ".jpg"
+        if body[:8] == b"\x89PNG\r\n\x1a\n":
+            return ".png"
+        if body[:4] == b"%PDF":
+            return ".pdf"
+        if body[:6] in (b"GIF87a", b"GIF89a"):
+            return ".gif"
+        return ".bin"
+
+    def pull_attachments(self, save_dir) -> list:
+        """Download every file attached to the CURRENT week into save_dir, fetching through
+        the browser context (so the signed URL's session/cookies apply). Returns the saved
+        Paths. Safe on weeks with no attachments (returns []). Switches to the Attachments
+        tab as a side effect — fine for hydration since we read the week before calling this.
+
+        Clears any existing attachment_* files in save_dir first so re-hydration is a clean
+        rebuild, not an accumulation."""
+        from pathlib import Path
+        save_dir = Path(save_dir)
+        self.open_attachments_tab()
+        urls = self.attachment_urls()
+        if not urls:
+            return []
+        save_dir.mkdir(parents=True, exist_ok=True)
+        for stale in save_dir.glob("attachment_*"):
+            try:
+                stale.unlink()
+            except Exception:
+                pass
+        saved: list = []
+        for i, url in enumerate(urls):
+            try:
+                resp = self.page.request.get(url, timeout=30000)
+                if not resp.ok:
+                    continue
+                body = resp.body()
+                p = save_dir / f"attachment_{i + 1}{self._sniff_ext(body)}"
+                p.write_bytes(body)
+                saved.append(p)
+            except Exception:
+                continue
+        return saved
 
     def download_week_pdf(self, save_to) -> object:
         """Click the Download button and capture the PDF that Damia produces. Refuses on
