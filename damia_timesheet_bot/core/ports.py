@@ -7,6 +7,7 @@ from typing import Protocol, runtime_checkable
 from .models import (
     ApprovalRecord,
     Holiday,
+    LeaveEntry,
     Submission,
     SubmissionStatus,
     Week,
@@ -17,6 +18,15 @@ from .models import (
 class HolidayProvider(Protocol):
     def is_holiday(self, day: date) -> bool: ...
     def holidays_in_range(self, start: date, end: date) -> list[Holiday]: ...
+
+
+@runtime_checkable
+class LeaveProvider(Protocol):
+    """The contractor's personal days-off ledger. `ConfigLeaveProvider` reads it from
+    config.yml today; an Outlook-calendar adapter can swap in later behind the same port."""
+
+    def leave_on(self, day: date) -> LeaveEntry | None: ...
+    def leave_in_range(self, start: date, end: date) -> list[LeaveEntry]: ...
 
 
 @runtime_checkable

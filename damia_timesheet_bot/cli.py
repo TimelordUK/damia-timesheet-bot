@@ -17,11 +17,17 @@ try:
 except Exception:
     pass
 
+from datetime import date
+
+from .adapters.holidays.uk_govuk import UkGovUkHolidayProvider
+from .adapters.leave.config_ledger import ConfigLeaveProvider
 from .adapters.state.csv_cache import CsvWeekCache
 from .adapters.timesheet.damia_playwright import DEFAULT_CDP_URL, DamiaTimesheetDriver
 from .core.config import ConfigError, load_or_scaffold
 from .core.hydrate import build_view, hydrate, write_view
 from .core.paths import DataPaths
+from .core.tracking import new_tracking_id
+from .core.weekplan import approval_subject, build_week_plan, sunday_of
 
 
 def cmd_hydrate(args: argparse.Namespace) -> int:
@@ -74,6 +80,45 @@ def cmd_view(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_plan(args: argparse.Namespace) -> int:
+    """Read-only: show what the bot WOULD put on the timesheet for a week, and the approval
+    subject it would draft. No portal, no Outlook — pure leave + bank-holiday logic."""
+    paths = DataPaths.resolve(args.data_dir)
+    try:
+        config, scaffolded = load_or_scaffold(paths.config_file)
+    except ConfigError as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        return 2
+    if scaffolded:
+        print(f">>> Scaffolded a config template at {paths.config_file}")
+
+    try:
+        leave = ConfigLeaveProvider.from_config(config)
+    except ConfigError as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        return 2
+    holidays = UkGovUkHolidayProvider(cache_dir=paths.root / "holidays")
+
+    anchor = date.fromisoformat(args.week) if args.week else date.today()
+    week_start = sunday_of(anchor)
+    plan = build_week_plan(week_start, holidays, leave)
+
+    print(f"Week {plan.week_start} – {plan.week_end}  (Sun..Sat)")
+    print(f"  billable days : {plan.billable_days}")
+    print(f"  day_units     : {','.join(f'{u:g}' for u in plan.day_units)}  (Sun..Sat)")
+    if plan.excluded:
+        print("  excluded:")
+        for e in plan.excluded:
+            print(f"    {e.date} {e.date.strftime('%a')}  {e.kind.value:13} {e.label}")
+    if plan.billable_days == 0:
+        print("\n  >>> 0 billable days — NOTHING to submit. The bot would draft no email "
+              "for this week.")
+    else:
+        subj = approval_subject(plan, new_tracking_id(date.today()))
+        print(f"\n  would draft subject:\n    {subj}")
+    return 0
+
+
 def cmd_tui(args: argparse.Namespace) -> int:
     # Import lazily so non-TUI commands don't pull in textual.
     from .tui.app import run_app
@@ -98,6 +143,10 @@ def main(argv: list[str] | None = None) -> int:
 
     v = sub.add_parser("view", help="Print the current view.json.")
     v.set_defaults(func=cmd_view)
+
+    pl = sub.add_parser("plan", help="Show the planned week (leave + bank holidays); no I/O.")
+    pl.add_argument("--week", help="Any date (YYYY-MM-DD) in the target week. Default: today.")
+    pl.set_defaults(func=cmd_plan)
 
     t = sub.add_parser("tui", help="Launch the Textual TUI (reads view.json).")
     t.set_defaults(func=cmd_tui)

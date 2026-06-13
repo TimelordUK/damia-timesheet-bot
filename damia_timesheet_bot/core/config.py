@@ -26,6 +26,20 @@ approver_emails:
   - manager1@example.com
   - manager2@example.com
 
+# Your days-off ledger. Bank holidays are detected automatically (gov.uk) — list ONLY
+# personal leave here. The bot subtracts these from the working week so it never claims a
+# day you didn't work, and a week that is entirely leave/holiday produces NO email at all.
+# Single day:   - date: 2026-08-25
+# Range (incl): - {start: 2026-12-24, end: 2026-12-31}
+# type is one of: annual | sick | unpaid   (default: annual)
+leave: []
+#   - date: 2026-08-25
+#     type: annual
+#     note: "long weekend"
+#   - start: 2026-12-24
+#     end: 2026-12-31
+#     type: annual
+
 # Optional: contract periods (for revenue grouping / sanity checks). Rate may change per job.
 # job_periods:
 #   - name: "ACME"
@@ -48,6 +62,7 @@ class Config:
     currency: str = "GBP"
     week_start: str = "sunday"
     approver_emails: list[str] = field(default_factory=list)
+    leave: list[dict] = field(default_factory=list)
     job_periods: list[dict] = field(default_factory=list)
 
     @property
@@ -64,6 +79,7 @@ class Config:
                 currency=str(data.get("currency", "GBP")),
                 week_start=str(data.get("week_start", "sunday")),
                 approver_emails=list(data.get("approver_emails") or []),
+                leave=list(data.get("leave") or []),
                 job_periods=list(data.get("job_periods") or []),
             )
         except KeyError as e:

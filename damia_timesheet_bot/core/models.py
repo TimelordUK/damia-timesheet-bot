@@ -14,11 +14,34 @@ class DayKind(str, Enum):
     NOT_WORKED = "not_worked"
 
 
+class LeaveType(str, Enum):
+    ANNUAL = "annual"
+    SICK = "sick"
+    UNPAID = "unpaid"
+
+    @property
+    def day_kind(self) -> "DayKind":
+        return {
+            LeaveType.ANNUAL: DayKind.ANNUAL_LEAVE,
+            LeaveType.SICK: DayKind.SICK,
+            LeaveType.UNPAID: DayKind.NOT_WORKED,
+        }[self]
+
+
 @dataclass(frozen=True)
 class Holiday:
     date: date
     title: str
     region: str
+
+
+@dataclass(frozen=True)
+class LeaveEntry:
+    """A day of personal leave from the contractor's ledger (config.yml `leave:`). A range
+    in config is expanded into one LeaveEntry per covered weekday by the LeaveProvider."""
+    date: date
+    type: LeaveType
+    note: str = ""
 
 
 @dataclass
@@ -85,6 +108,37 @@ class ApprovalRecord:
     approver_email: str
     approved_at: datetime
     approval_png_path: Path
+
+
+@dataclass(frozen=True)
+class ExcludedDay:
+    """A weekday (Mon–Fri) that is NOT billable, with the reason. Bank-holiday exclusions
+    are named in the approval-email subject per the real grammar; leave exclusions just
+    reduce the day count and are noted in the body."""
+    date: date
+    kind: DayKind            # BANK_HOLIDAY | ANNUAL_LEAVE | SICK | NOT_WORKED (unpaid)
+    label: str               # e.g. "Spring bank holiday" or "annual leave"
+
+
+@dataclass(frozen=True)
+class WeekPlan:
+    """Pure projection of what a week SHOULD contain, computed from the working-day
+    convention + bank holidays + the leave ledger. Drives both the timesheet fill and the
+    approval-email subject. `billable_days` == 0 means nothing to submit (full leave /
+    holiday week) — the orchestrator must NOT draft an email for it."""
+    week_start: date
+    week_end: date
+    worked_dates: tuple[date, ...]
+    excluded: tuple[ExcludedDay, ...]
+    day_units: tuple[float, ...]      # Sun..Sat, 1.0 on worked days else 0.0
+
+    @property
+    def billable_days(self) -> int:
+        return len(self.worked_dates)
+
+    @property
+    def bank_holidays(self) -> tuple[ExcludedDay, ...]:
+        return tuple(e for e in self.excluded if e.kind == DayKind.BANK_HOLIDAY)
 
 
 @dataclass
