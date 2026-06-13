@@ -36,7 +36,7 @@ class Decision:
         return self.kind is DecisionKind.READY_TO_DRAFT
 
 
-_EDITABLE_PORTAL = ("draft", "rejected")
+_EDITABLE_PORTAL = ("draft", "rejected", "new")
 
 
 def _units_match(a: tuple[float, ...], b: tuple[float, ...]) -> bool:

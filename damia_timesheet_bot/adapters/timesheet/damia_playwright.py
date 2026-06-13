@@ -26,7 +26,12 @@ SEL_DATE_CAPTION     = "#MainContent_lblDateCaption"
 SEL_BTN_PREV_WEEK    = "#MainContent_btnPrevWeek"
 SEL_BTN_NEXT_WEEK    = "#MainContent_btnNextWeek"
 SEL_BTN_CURRENT_WEEK = "#MainContent_btnCurrentWeek"
-SEL_STATUS_SPAN      = "[class*='timesheetStatus']"
+# Post-reskin (seen 2026-06-13): status is a Bulma "tag" carrying the word as text, e.g.
+# <div class="tag is-medium is-success is-light">Approved</div> inside .tsInfoPanelMeta.
+# The old `[class*='timesheetStatus']` span is gone. A brand-new/unsaved week has no tag.
+SEL_STATUS_TAG       = ".tsInfoPanel .tag"
+STATUS_WORDS         = ("Approved", "Submitted", "Draft", "Rejected",
+                        "Awaiting Approval", "Pending", "Cancelled")
 # Affirm/decline in a jQuery UI confirm dialog. Text varies; class is the stable signal.
 SEL_CONFIRM_AFFIRM   = ".ui-dialog-buttonpane button.is-success"
 SEL_CONFIRM_DECLINE  = ".ui-dialog-buttonpane button.is-danger"
@@ -38,9 +43,11 @@ SEL_DIALOG_ANY_BUTTON = ".ui-dialog:visible .ui-dialog-buttonpane button"
 # Damia embeds in every form-element id for a given timesheet). The driver discovers
 # this id dynamically after each navigation.
 FMT_ENTRIES_WRAPPER   = "#tsEntriesWrapper_{tid}"
-FMT_BTN_AUTOFILL      = "#MainContent_tblSubmit_{tid}_pnlHeader_pnlFooterButtons_btnPopulateTimesheet"
-FMT_BTN_CANCEL        = "#MainContent_tblSubmit_{tid}_pnlHeader_pnlFooterButtons_btnCancel"
-FMT_BTN_DOWNLOAD      = "#MainContent_tblSubmit_{tid}_pnlHeader_pnlFooterButtons_btnDownload"
+# Post-reskin the footer-button ids dropped the `pnlHeader_` segment:
+# was MainContent_tblSubmit_{tid}_pnlHeader_pnlFooterButtons_btnX, now _pnlFooterButtons_btnX.
+FMT_BTN_AUTOFILL      = "#MainContent_tblSubmit_{tid}_pnlFooterButtons_btnPopulateTimesheet"
+FMT_BTN_CANCEL        = "#MainContent_tblSubmit_{tid}_pnlFooterButtons_btnCancel"
+FMT_BTN_DOWNLOAD      = "#MainContent_tblSubmit_{tid}_pnlFooterButtons_btnDownload"
 FMT_BTN_SAVE_DRAFT    = "#MainContent_tblSubmit_{tid}_pnlApproverFooter_btnSaveTimesheet"
 FMT_BTN_SUBMIT        = "#MainContent_tblSubmit_{tid}_pnlApproverFooter_btnSubmit"  # never wired
 FMT_WEEK_TOTAL        = "#lblTotalDaysForWeek_{tid}"
@@ -50,9 +57,10 @@ FMT_BTN_ATTACH_TAB    = "#btnShowAttachmentsPanel_{tid}"  # onclick=showAttachme
 FMT_ATTACH_WRAPPER    = "#tsAttachmentWrapper_{tid}"
 
 DAMIA_VALUES = ("1.00", "0.75", "0.50", "0.25", "0.00")
-STATUS_CLASS_RE  = re.compile(r"timesheetStatus(\w+)")
 DATE_CAPTION_RE  = re.compile(r"(\d{2}/\d{2}/\d{2})\s*-\s*(\d{2}/\d{2}/\d{2})")
 TIMESHEET_ID_RE  = re.compile(r"tsEntriesWrapper_(\d+)")
+# A week whose sheet has not been created/saved yet shows no status tag at all.
+STATUS_NEW = "New"
 
 
 def units_to_damia_value(units: float) -> str:
@@ -167,15 +175,20 @@ class DamiaTimesheetDriver:
 
     def _refresh_timesheet_id(self) -> int:
         """Find the Damia timesheet id embedded in form-element IDs on the current page.
-        Called after attach and after every navigation since each week has its own id."""
+        Called after attach and after every navigation since each week gets a fresh id.
+
+        Post-reskin the id increments per navigation and stale wrappers can briefly linger
+        in the DOM, so picking the first match grabs the wrong (hidden) week. We pick the
+        VISIBLE wrapper instead, falling back to the first if none reports as visible yet."""
         tid = self.page.evaluate(
             """() => {
-              const candidates = document.querySelectorAll('[id^="tsEntriesWrapper_"]');
-              for (const el of candidates) {
-                const m = el.id.match(/^tsEntriesWrapper_(\\d+)$/);
-                if (m) return parseInt(m[1], 10);
-              }
-              return null;
+              const vis = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+              const wraps = [...document.querySelectorAll('[id^="tsEntriesWrapper_"]')]
+                .map(el => ({el, m: el.id.match(/^tsEntriesWrapper_(\\d+)$/)}))
+                .filter(x => x.m);
+              if (!wraps.length) return null;
+              const pick = wraps.find(x => vis(x.el)) || wraps[0];
+              return parseInt(pick.m[1], 10);
             }"""
         )
         if tid is None:
@@ -201,15 +214,36 @@ class DamiaTimesheetDriver:
         return _parse_damia_date(m.group(1)), _parse_damia_date(m.group(2))
 
     def status_word(self) -> str:
-        cls = self.page.locator(SEL_STATUS_SPAN).first.evaluate("e => e.className", timeout=5000)
-        m = STATUS_CLASS_RE.search(cls)
-        return m.group(1) if m else "Unknown"
+        """Read the status from the Bulma 'tag' in the info panel (post-reskin). Returns the
+        status word as Damia renders it ('Approved', 'Draft', 'Submitted', 'Rejected', ...),
+        or 'New' when the week has no tag yet (an unsaved/uninitialised sheet)."""
+        word = self.page.evaluate(
+            """(known) => {
+              const tags = [...document.querySelectorAll('.tsInfoPanel .tag')];
+              const norm = s => (s || '').trim();
+              // Prefer an exact known status word.
+              for (const t of tags) {
+                const txt = norm(t.textContent);
+                if (known.some(k => k.toLowerCase() === txt.toLowerCase())) return txt;
+              }
+              // Else a colour-coded status tag (is-success/-warning/-danger/-info) with short text.
+              for (const t of tags) {
+                const txt = norm(t.textContent);
+                if (txt && txt.length < 24 &&
+                    /\\bis-(success|warning|danger|info)\\b/.test(t.className)) return txt;
+              }
+              return null;
+            }""",
+            list(STATUS_WORDS),
+        )
+        return word or STATUS_NEW
 
     def is_editable(self) -> bool:
         """True if the current week is safely editable. Damia doesn't always set <select>.disabled
         on Approved/Submitted sheets (enforcement is server-side), so we go by the status word:
-        only 'Draft' (and 'Rejected', which Damia re-opens for editing) is safely mutable."""
-        return self.status_word().lower() in ("draft", "rejected")
+        'Draft', 'Rejected' (Damia re-opens those for editing), and 'New' (an unsaved sheet)
+        are safely mutable; 'Submitted'/'Approved' are not."""
+        return self.status_word().lower() in ("draft", "rejected", "new")
 
     def read_week(self) -> Week:
         """Return a Week reflecting the current page state. Works on both editable and
