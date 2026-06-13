@@ -84,11 +84,17 @@ class Week:
 
 
 class SubmissionStatus(str, Enum):
-    DRAFT = "draft"
-    EMAIL_DRAFTED = "email_drafted"
-    AWAITING_APPROVAL = "awaiting_approval"
-    APPROVED = "approved"
-    SENT_TO_PORTAL = "sent_to_portal"
+    DRAFT = "draft"                      # reserved / pre-draft
+    EMAIL_DRAFTED = "email_drafted"      # draft sitting in Outlook Drafts, not sent
+    AWAITING_APPROVAL = "awaiting_approval"  # user sent it; watching for the reply
+    APPROVED = "approved"                # a clean "Approved" reply was matched
+    SENT_TO_PORTAL = "sent_to_portal"    # proof uploaded to Damia (the manual last step)
+    NEEDS_ATTENTION = "needs_attention"  # boss queried/rejected, or an inconsistency — manual
+
+    @property
+    def is_in_flight(self) -> bool:
+        """True while a draft exists or we're awaiting a reply — the bot must NOT re-draft."""
+        return self in (SubmissionStatus.EMAIL_DRAFTED, SubmissionStatus.AWAITING_APPROVAL)
 
 
 @dataclass

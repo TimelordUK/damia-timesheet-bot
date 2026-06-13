@@ -22,8 +22,10 @@ from datetime import date
 from .adapters.holidays.uk_govuk import UkGovUkHolidayProvider
 from .adapters.leave.config_ledger import ConfigLeaveProvider
 from .adapters.state.csv_cache import CsvWeekCache
+from .adapters.state.submission_store import JsonSubmissionStore
 from .adapters.timesheet.damia_playwright import DEFAULT_CDP_URL, DamiaTimesheetDriver
 from .core.config import ConfigError, load_or_scaffold
+from .core.decide import DecisionKind, decide_week
 from .core.hydrate import build_view, hydrate, write_view
 from .core.paths import DataPaths
 from .core.tracking import new_tracking_id
@@ -103,17 +105,31 @@ def cmd_plan(args: argparse.Namespace) -> int:
     week_start = sunday_of(anchor)
     plan = build_week_plan(week_start, holidays, leave)
 
+    # Portal truth (cached) + email-side overlay — both read-only local files.
+    portal = next((r for r in CsvWeekCache(paths.csv_path).read()
+                   if r.week_start == week_start), None)
+    submission = JsonSubmissionStore(paths.submissions_json).get_by_week(week_start)
+    decision = decide_week(plan, portal, submission)
+
     print(f"Week {plan.week_start} – {plan.week_end}  (Sun..Sat)")
     print(f"  billable days : {plan.billable_days}")
     print(f"  day_units     : {','.join(f'{u:g}' for u in plan.day_units)}  (Sun..Sat)")
+    print(f"  portal        : {portal.status if portal else '(not hydrated)'}"
+          + (f"  units={','.join(f'{u:g}' for u in portal.day_units)}" if portal else ""))
     if plan.excluded:
         print("  excluded:")
         for e in plan.excluded:
             print(f"    {e.date} {e.date.strftime('%a')}  {e.kind.value:13} {e.label}")
-    if plan.billable_days == 0:
-        print("\n  >>> 0 billable days — NOTHING to submit. The bot would draft no email "
-              "for this week.")
-    else:
+
+    marker = {
+        DecisionKind.READY_TO_DRAFT: "[READY]",
+        DecisionKind.ALREADY_IN_FLIGHT: "[IN FLIGHT]",
+        DecisionKind.NOTHING_TO_DO: "[NOTHING TO DO]",
+        DecisionKind.MANUAL_INTERVENTION: "[MANUAL]",
+    }[decision.kind]
+    print(f"\n  decision: {marker} {decision.reason}")
+
+    if decision.kind is DecisionKind.READY_TO_DRAFT:
         subj = approval_subject(plan, new_tracking_id(date.today()))
         print(f"\n  would draft subject:\n    {subj}")
     return 0

@@ -41,6 +41,13 @@ class DataPaths:
     def chrome_profile(self) -> Path:
         return self.root / "chrome-profile"
 
+    @property
+    def submissions_json(self) -> Path:
+        """Email-side submission overlay. Semi-precious: rebuildable from an Outlook recovery
+        scan, but kept OUTSIDE cache/ so a `hydrate --full` cache wipe can't erase what we've
+        drafted/sent (and the tracking-ids we issued)."""
+        return self.root / "submissions.json"
+
     # --- disposable cache -----------------------------------------------------
     @property
     def cache_dir(self) -> Path:
