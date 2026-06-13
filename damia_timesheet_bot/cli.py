@@ -17,7 +17,7 @@ try:
 except Exception:
     pass
 
-from datetime import date
+from datetime import date, timedelta
 
 from .adapters.holidays.uk_govuk import UkGovUkHolidayProvider
 from .adapters.leave.config_ledger import ConfigLeaveProvider
@@ -27,6 +27,7 @@ from .adapters.timesheet.damia_playwright import DEFAULT_CDP_URL, DamiaTimesheet
 from .core.config import ConfigError, load_or_scaffold
 from .core.decide import DecisionKind, decide_week
 from .core.hydrate import build_view, hydrate, write_view
+from .core.models import Day, Week, WeekRecord
 from .core.paths import DataPaths
 from .core.tracking import new_tracking_id
 from .core.weekplan import approval_subject, build_week_plan, sunday_of
@@ -135,6 +136,68 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fill_draft(args: argparse.Namespace) -> int:
+    """Fill the timesheet for a week per the plan and SAVE A DRAFT. Never submits.
+
+    Runs the circuit-breaker against the LIVE week first: only a READY_TO_DRAFT decision
+    mutates anything. `--dry-run` reads + decides but changes nothing."""
+    paths = DataPaths.resolve(args.data_dir)
+    try:
+        config, _ = load_or_scaffold(paths.config_file)
+        leave = ConfigLeaveProvider.from_config(config)
+    except ConfigError as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        return 2
+    holidays = UkGovUkHolidayProvider(cache_dir=paths.root / "holidays")
+
+    anchor = date.fromisoformat(args.week) if args.week else date.today()
+    week_start = sunday_of(anchor)
+    plan = build_week_plan(week_start, holidays, leave)
+    submission = JsonSubmissionStore(paths.submissions_json).get_by_week(week_start)
+
+    print(f"Week {plan.week_start} – {plan.week_end}: plan = {plan.billable_days} day(s), "
+          f"units {','.join(f'{u:g}' for u in plan.day_units)} (Sun..Sat)")
+    if plan.billable_days == 0:
+        print(">>> 0 billable days — nothing to fill.")
+        return 0
+
+    with DamiaTimesheetDriver(cdp_url=args.cdp_url).attached() as drv:
+        drv.navigate_to_week(week_start)
+        if drv.current_week_range()[0] != week_start:
+            print(f"[abort] driver landed on {drv.current_week_range()[0]}, not {week_start}.",
+                  file=sys.stderr)
+            return 1
+        live = drv.read_week()
+        live_record = WeekRecord(
+            week_start=week_start, week_end=plan.week_end, status=drv.status_word(),
+            total_units=live.total_units, worked_days=live.worked_days,
+            day_units=tuple(d.units for d in live.days),
+        )
+        decision = decide_week(plan, live_record, submission)
+        print(f"  live portal: {live_record.status}  units="
+              f"{','.join(f'{u:g}' for u in live_record.day_units)}")
+        print(f"  decision   : {decision.kind.value} — {decision.reason}")
+
+        if decision.kind is not DecisionKind.READY_TO_DRAFT:
+            print(">>> Not READY_TO_DRAFT — no changes made.")
+            return 0 if decision.kind is DecisionKind.NOTHING_TO_DO else 1
+
+        if args.dry_run:
+            print(">>> --dry-run: would fill the above plan and Save draft (not submit). "
+                  "No changes made.")
+            return 0
+
+        week = Week(start=week_start, days=[
+            Day(date=week_start + timedelta(days=i), units=plan.day_units[i]) for i in range(7)
+        ])
+        drv.fill_week(week)
+        drv.save_draft()
+        after = drv.read_week()
+        print(f">>> Filled and saved DRAFT. Portal now: {drv.status_word()}  "
+              f"{after.total_units:g} day(s). (Never submitted.)")
+    return 0
+
+
 def cmd_tui(args: argparse.Namespace) -> int:
     # Import lazily so non-TUI commands don't pull in textual.
     from .tui.app import run_app
@@ -163,6 +226,14 @@ def main(argv: list[str] | None = None) -> int:
     pl = sub.add_parser("plan", help="Show the planned week (leave + bank holidays); no I/O.")
     pl.add_argument("--week", help="Any date (YYYY-MM-DD) in the target week. Default: today.")
     pl.set_defaults(func=cmd_plan)
+
+    fd = sub.add_parser("fill-draft",
+                        help="Fill a week per the plan and Save draft (never submits).")
+    fd.add_argument("--week", help="Any date (YYYY-MM-DD) in the target week. Default: today.")
+    fd.add_argument("--cdp-url", default=DEFAULT_CDP_URL)
+    fd.add_argument("--dry-run", action="store_true",
+                    help="Read + decide only; make no changes.")
+    fd.set_defaults(func=cmd_fill_draft)
 
     t = sub.add_parser("tui", help="Launch the Textual TUI (reads view.json).")
     t.set_defaults(func=cmd_tui)

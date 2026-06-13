@@ -430,6 +430,9 @@ class DamiaTimesheetDriver:
             value=damia_value, timeout=5000,
         )
         self._wait_for_postback()
+        # A day-value postback can re-render the wrapper with a fresh id (ids increment per
+        # postback post-reskin), so re-discover before the next set_day goes stale.
+        self._refresh_timesheet_id()
 
     def fill_week(self, week: Week) -> None:
         if len(week.days) != 7:
