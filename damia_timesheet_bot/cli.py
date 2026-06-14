@@ -304,6 +304,81 @@ def cmd_draft(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_attach_proof(args: argparse.Namespace) -> int:
+    """Upload the approval-proof PNG to a week's Damia Attachments panel. This attaches
+    evidence only — it never clicks Submit. Defaults to the week's approval proof; --file
+    overrides. Marks the submission SENT_TO_PORTAL on success."""
+    from pathlib import Path
+    paths = DataPaths.resolve(args.data_dir)
+    try:
+        config, _ = load_or_scaffold(paths.config_file)
+    except ConfigError as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        return 2
+
+    anchor = date.fromisoformat(args.week) if args.week else date.today()
+    week_start = sunday_of(anchor)
+    store = JsonSubmissionStore(paths.submissions_json)
+    sub = store.get_by_week(week_start)
+
+    if args.file:
+        proof = Path(args.file)
+    elif sub is not None:
+        proof = paths.proofs_dir / f"approval_{week_start.isoformat()}_{sub.tracking_id.split('-')[-1]}.png"
+    else:
+        print(f"[abort] no submission for {week_start} and no --file given.", file=sys.stderr)
+        return 2
+
+    if not proof.exists():
+        print(f"[abort] proof not found: {proof}\n        Run `watch` to generate it, or pass "
+              f"--file.", file=sys.stderr)
+        return 2
+    _ok_states = (SubmissionStatus.APPROVED, SubmissionStatus.SENT_TO_PORTAL)
+    if sub is not None and sub.status not in _ok_states and not args.file:
+        print(f"[abort] {week_start} is {sub.status.value}, not approved — refusing to attach an "
+              f"unapproved proof. Use --file to override.", file=sys.stderr)
+        return 1
+
+    print(f"Week {week_start}: attaching {proof.name} ({proof.stat().st_size} bytes)")
+    if args.dry_run:
+        print(">>> --dry-run: would upload the above to the Damia Attachments panel. No changes.")
+        return 0
+
+    with DamiaTimesheetDriver(cdp_url=args.cdp_url).attached() as drv:
+        drv.navigate_to_week(week_start)
+        if drv.current_week_range()[0] != week_start:
+            print(f"[abort] driver landed on {drv.current_week_range()[0]}, not {week_start}.",
+                  file=sys.stderr)
+            return 1
+        drv.open_attachments_tab()
+        existing = []
+        try:
+            existing = drv.attachment_urls()
+        except Exception:
+            pass
+        if existing and not args.replace:
+            print(f"  {len(existing)} attachment(s) already on this week — skipping upload "
+                  f"(use --replace to add another).")
+            ok = True
+        else:
+            ok = drv.upload_attachment(proof)
+            if not ok:
+                print(">>> Upload did not confirm within the timeout — check the portal "
+                      "manually.", file=sys.stderr)
+                return 1
+
+        saved = False
+        if not args.no_save:
+            drv.save_draft()   # bottom-left Save draft — NEVER Submit
+            saved = True
+
+    if sub is not None:
+        store.mark_status(sub.tracking_id, SubmissionStatus.SENT_TO_PORTAL)
+    tail = "and Saved the draft" if saved else "(draft NOT saved — use without --no-save)"
+    print(f">>> Proof attached {tail}. Submit was NOT clicked — do the final submit yourself.")
+    return 0
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Check in-flight submissions for an approval reply. On a clean 'Approved' reply, render
     the proof PNG and advance the week to APPROVED. A non-approval reply (a query) flags the
@@ -412,6 +487,18 @@ def main(argv: list[str] | None = None) -> int:
     dr.add_argument("--force", action="store_true",
                     help="Re-draft a week already in flight: delete the stale draft and redo.")
     dr.set_defaults(func=cmd_draft)
+
+    ap = sub.add_parser("attach-proof",
+                        help="Upload a week's approval-proof PNG to Damia Attachments (no submit).")
+    ap.add_argument("--week", help="Any date (YYYY-MM-DD) in the target week. Default: today.")
+    ap.add_argument("--file", help="Attach this file instead of the week's approval proof.")
+    ap.add_argument("--cdp-url", default=DEFAULT_CDP_URL)
+    ap.add_argument("--dry-run", action="store_true", help="Locate + report only; upload nothing.")
+    ap.add_argument("--no-save", action="store_true",
+                    help="Attach but don't click Save draft afterwards.")
+    ap.add_argument("--replace", action="store_true",
+                    help="Upload even if the week already has an attachment.")
+    ap.set_defaults(func=cmd_attach_proof)
 
     w = sub.add_parser("watch",
                        help="Check in-flight submissions for approval replies; render proofs.")

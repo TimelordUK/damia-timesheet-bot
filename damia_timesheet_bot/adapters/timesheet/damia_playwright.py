@@ -55,6 +55,9 @@ FMT_DAY_SELECT        = "#ctlEnd_{tid}_{day}_0"
 FMT_DAILY_TOTAL       = "#pnlDailyDaysDetail_{tid}_{day}"
 FMT_BTN_ATTACH_TAB    = "#btnShowAttachmentsPanel_{tid}"  # onclick=showAttachmentPanel(tid)
 FMT_ATTACH_WRAPPER    = "#tsAttachmentWrapper_{tid}"
+# Hidden jQuery-fileupload input shared by the active week's Attachments panel. Setting files
+# on it triggers the AJAX upload (the visible "Upload from device" button just clicks it).
+SEL_FILE_UPLOAD_INPUT = "#fileupload"
 
 DAMIA_VALUES = ("1.00", "0.75", "0.50", "0.25", "0.00")
 DATE_CAPTION_RE  = re.compile(r"(\d{2}/\d{2}/\d{2})\s*-\s*(\d{2}/\d{2}/\d{2})")
@@ -633,6 +636,66 @@ class DamiaTimesheetDriver:
             except Exception:
                 continue
         return saved
+
+    def _count_attachment_imgs(self) -> int:
+        return self.page.evaluate(
+            """(tid) => {
+              const w = document.querySelector(`#tsAttachmentWrapper_${tid}`);
+              return w ? w.querySelectorAll('img[src]').length : 0;
+            }""",
+            self.timesheet_id,
+        )
+
+    def _attachment_panel_text(self) -> str:
+        return self.page.evaluate(
+            """(tid) => {
+              const w = document.querySelector(`#tsAttachmentWrapper_${tid}`);
+              return w ? (w.innerText || '') : '';
+            }""",
+            self.timesheet_id,
+        )
+
+    def upload_attachment(self, file_path, timeout_s: int = 40) -> bool:
+        """Upload a file to the CURRENT week's Attachments panel (e.g. the approval proof).
+        This attaches evidence — it is NOT a submit; Submit is never clicked. Returns True once
+        the new attachment shows in the panel.
+
+        Driven through the visible 'Upload from device' button via the file-chooser: the button
+        runs setup (targets this week's timesheet) before opening the picker, so setting files
+        on the hidden #fileupload input directly does nothing. Falls back to the raw input."""
+        from pathlib import Path
+        p = Path(file_path)
+        if not p.exists():
+            raise FileNotFoundError(f"attachment not found: {p}")
+        if p.stat().st_size > 10 * 1024 * 1024:
+            raise ValueError(f"{p.name} exceeds Damia's 10 MB attachment limit.")
+
+        self.open_attachments_tab()
+        before_imgs = self._count_attachment_imgs()
+        before_text = self._attachment_panel_text()
+        stem = p.stem[:12]  # Damia may truncate the displayed name
+
+        btn = self.page.locator(
+            f"#tsAttachmentWrapper_{self.timesheet_id} button", has_text="Upload from device"
+        ).first
+        try:
+            with self.page.expect_file_chooser(timeout=10000) as fc:
+                btn.click(timeout=5000)
+            fc.value.set_files(str(p))
+        except Exception:
+            self.page.locator(SEL_FILE_UPLOAD_INPUT).set_input_files(str(p), timeout=10000)
+
+        for _ in range(timeout_s):
+            self.page.wait_for_timeout(1000)
+            try:
+                text = self._attachment_panel_text()
+                if (self._count_attachment_imgs() > before_imgs
+                        or stem in text
+                        or len(text) > len(before_text) + 20):
+                    return True
+            except Exception:
+                pass
+        return False
 
     def download_week_pdf(self, save_to) -> object:
         """Click the Download button and capture the PDF that Damia produces. Refuses on
