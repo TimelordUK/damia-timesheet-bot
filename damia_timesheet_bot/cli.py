@@ -25,7 +25,7 @@ from .adapters.leave.config_ledger import ConfigLeaveProvider
 from .adapters.state.csv_cache import CsvWeekCache
 from .adapters.state.submission_store import JsonSubmissionStore
 from .adapters.timesheet.damia_playwright import DEFAULT_CDP_URL, DamiaTimesheetDriver
-from .core.classify import ApprovalConfig
+from .core.classify import ApprovalConfig, classify_reply, extract_new_text
 from .core.config import ConfigError, load_or_scaffold
 from .core.decide import Decision, DecisionKind, decide_week
 from .core.hydrate import build_view, hydrate, write_view
@@ -294,6 +294,68 @@ def cmd_draft(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Check in-flight submissions for an approval reply. On a clean 'Approved' reply, render
+    the proof PNG and advance the week to APPROVED. A non-approval reply (a query) flags the
+    week needs_attention. Read-only against Outlook except writing proofs + state."""
+    paths = DataPaths.resolve(args.data_dir)
+    try:
+        config, _ = load_or_scaffold(paths.config_file)
+    except ConfigError as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        return 2
+
+    store = JsonSubmissionStore(paths.submissions_json)
+    approval_cfg = ApprovalConfig.from_dict(config.approval)
+    inflight = [s for s in store.list_recent(weeks=args.weeks) if s.status.is_in_flight]
+    if not inflight:
+        print("No in-flight submissions to check.")
+        return 0
+
+    drv = OutlookComEmailDriver().connect()
+    for s in inflight:
+        print(f"\n{s.week_start}  {s.tracking_id}  ({s.status.value})")
+        replies = [r for r in (drv.reply_summary(mid)
+                               for mid in drv.find_by_tracking_id(s.tracking_id))
+                   if r["is_reply"]]
+        if not replies:
+            print("  no reply yet — still awaiting approval.")
+            continue
+
+        approved = None
+        others: list = []
+        for r in replies:
+            verdict = classify_reply(extract_new_text(r["body"]), approval_cfg)
+            if verdict.is_approval:
+                approved = r
+            else:
+                others.append((r, verdict))
+
+        if approved is not None:
+            out = (paths.proofs_dir /
+                   f"approval_{s.week_start.isoformat()}_{s.tracking_id.split('-')[-1]}.png")
+            if args.dry_run:
+                print(f"  APPROVED by {approved['sender_smtp']} — would render proof to "
+                      f"{out.name} (dry-run).")
+                continue
+            paths.ensure_proofs()
+            drv.render_proof(approved["entry_id"], out)
+            store.mark_status(s.tracking_id, SubmissionStatus.APPROVED)
+            print(f"  APPROVED by {approved['sender_smtp']} ({approved['received']}).")
+            print(f"  proof: {out}")
+            print("  -> upload this to the Damia week's Attachments tab (manual final step).")
+        else:
+            r, verdict = others[-1]
+            if not args.dry_run:
+                store.mark_status(s.tracking_id, SubmissionStatus.NEEDS_ATTENTION)
+            verb = "would mark" if args.dry_run else "marked"
+            print(f"  reply from {r['sender_smtp']} is NOT a clean approval — {verb} "
+                  f"needs_attention.")
+            print(f"    {verdict.reason}")
+            print(f"    reply text: {verdict.cleaned[:120]!r}")
+    return 0
+
+
 def cmd_tui(args: argparse.Namespace) -> int:
     # Import lazily so non-TUI commands don't pull in textual.
     from .tui.app import run_app
@@ -338,6 +400,13 @@ def main(argv: list[str] | None = None) -> int:
     dr.add_argument("--dry-run", action="store_true",
                     help="Fill + screenshot + show the email, but don't touch Outlook.")
     dr.set_defaults(func=cmd_draft)
+
+    w = sub.add_parser("watch",
+                       help="Check in-flight submissions for approval replies; render proofs.")
+    w.add_argument("--weeks", type=int, default=12, help="How far back to consider (default 12).")
+    w.add_argument("--dry-run", action="store_true",
+                   help="Classify + report only; render no proof, change no state.")
+    w.set_defaults(func=cmd_watch)
 
     t = sub.add_parser("tui", help="Launch the Textual TUI (reads view.json).")
     t.set_defaults(func=cmd_tui)
