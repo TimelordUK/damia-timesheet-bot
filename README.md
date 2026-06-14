@@ -38,6 +38,12 @@ uv sync
 uv run playwright install chromium   # needed for rendering the approval-proof PNG
 ```
 
+> **Behind a corporate proxy?** If `uv sync` fails with TLS/certificate errors, allow the
+> package hosts explicitly (see [Corporate network](#corporate-network-ssl-interception)):
+> ```powershell
+> uv sync --allow-insecure-host github.com --allow-insecure-host pypi.org --allow-insecure-host files.pythonhosted.org
+> ```
+
 ### 2. Launch Chrome with the remote-debugging port
 
 > ⚠️ **Chrome 136+ silently ignores `--remote-debugging-port` with the default user-data-dir.** Use the dedicated profile the script creates; you log in to Damia once and the cookie persists.
@@ -127,6 +133,15 @@ The **only** outbound internet call the tool makes is fetching UK bank holidays 
 ```powershell
 $env:REQUESTS_CA_BUNDLE = "C:\path\to\corporate-root-ca.pem"
 ```
+
+**Installing dependencies** (`uv sync`) can also hit the same TLS interception. Allow the
+package hosts explicitly:
+
+```powershell
+uv sync --allow-insecure-host github.com --allow-insecure-host pypi.org --allow-insecure-host files.pythonhosted.org
+```
+
+(Equivalently, set `UV_INSECURE_HOST="github.com pypi.org files.pythonhosted.org"` so you don't repeat the flags. `uv run playwright install chromium` downloads its browser from a separate CDN; if that step is blocked, point Node at the CA with `$env:NODE_EXTRA_CA_CERTS = "C:\path\to\corporate-root-ca.pem"`.)
 
 ## If the portal looks reskinned
 
