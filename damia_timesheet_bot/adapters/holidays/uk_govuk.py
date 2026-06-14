@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -13,6 +14,10 @@ from ...core.models import Holiday
 GOVUK_BANK_HOLIDAYS_URL = "https://www.gov.uk/bank-holidays.json"
 
 REGIONS = ("england-and-wales", "scotland", "northern-ireland")
+
+# Vendored snapshot used when gov.uk is unreachable (e.g. a corporate proxy doing SSL
+# interception that `requests` won't trust). Refreshed whenever a live fetch succeeds.
+FALLBACK_SNAPSHOT = Path(__file__).with_name("bank_holidays_fallback.json")
 
 
 @dataclass
@@ -56,12 +61,35 @@ class UkGovUkHolidayProvider:
 
     def _fetch_cached(self) -> dict:
         cache_path = self.cache_dir / "bank-holidays.json"
+        # 1) Fresh on-disk cache wins — no network.
         if cache_path.exists():
             age = datetime.now() - datetime.fromtimestamp(cache_path.stat().st_mtime)
             if age < self.cache_ttl:
                 return json.loads(cache_path.read_text(encoding="utf-8"))
-        response = requests.get(GOVUK_BANK_HOLIDAYS_URL, timeout=self.request_timeout_s)
-        response.raise_for_status()
-        text = response.text
-        cache_path.write_text(text, encoding="utf-8")
-        return json.loads(text)
+
+        # 2) Try live. requests honours REQUESTS_CA_BUNDLE/CURL_CA_BUNDLE, so pointing those at
+        #    your corporate root CA makes this work through an intercepting proxy.
+        try:
+            response = requests.get(GOVUK_BANK_HOLIDAYS_URL, timeout=self.request_timeout_s)
+            response.raise_for_status()
+            text = response.text
+            json.loads(text)  # validate before caching
+            cache_path.write_text(text, encoding="utf-8")
+            return json.loads(text)
+        except Exception as e:
+            # 3) Offline / SSL-intercepted: stale cache, then the vendored snapshot.
+            if cache_path.exists():
+                print(f"[holidays] gov.uk unreachable ({type(e).__name__}); using cached copy.",
+                      file=sys.stderr)
+                return json.loads(cache_path.read_text(encoding="utf-8"))
+            if FALLBACK_SNAPSHOT.exists():
+                print(f"[holidays] gov.uk unreachable ({type(e).__name__}); using bundled "
+                      f"snapshot. Set REQUESTS_CA_BUNDLE to your corporate root CA for live data.",
+                      file=sys.stderr)
+                text = FALLBACK_SNAPSHOT.read_text(encoding="utf-8")
+                try:
+                    cache_path.write_text(text, encoding="utf-8")  # seed the cache
+                except Exception:
+                    pass
+                return json.loads(text)
+            raise

@@ -120,6 +120,14 @@ Most write commands take `--dry-run` (decide/preview, change nothing) — use it
 
 ---
 
+## Corporate network (SSL interception)
+
+The **only** outbound internet call the tool makes is fetching UK bank holidays from `gov.uk` (everything else goes through your already-authenticated browser or local Outlook COM). Behind a corporate proxy that intercepts TLS with a private root CA, that call fails — so the tool **falls back to a bundled bank-holidays snapshot** (it prints a warning) and drafting still works. For live gov.uk data, point requests at your corporate root CA before running:
+
+```powershell
+$env:REQUESTS_CA_BUNDLE = "C:\path\to\corporate-root-ca.pem"
+```
+
 ## If the portal looks reskinned
 
 Damia changes its markup periodically (it did on 2026-06-13). If a command fails on a selector, run the **health-check** first — it reports which of the driver's selectors still resolve, so the repair target is obvious:
