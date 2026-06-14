@@ -16,6 +16,10 @@
 .PARAMETER ProfileDir
   Override the dedicated profile directory.
 
+.PARAMETER ChromeExe
+  Path to chrome.exe. If omitted, auto-detected from the registry App Paths and the common
+  install locations: Program Files, Program Files (x86), and per-user LocalAppData.
+
 .PARAMETER KillExisting
   Kill all running chrome.exe processes before launching. Use when you suspect
   a stale Chrome is holding the profile lock.
@@ -36,7 +40,7 @@
 param(
     [int]   $Port = 9222,
     [string]$ProfileDir = "$env:LOCALAPPDATA\damia-timesheet-bot\chrome-profile",
-    [string]$ChromeExe = "C:\Program Files\Google\Chrome\Application\chrome.exe",
+    [string]$ChromeExe = "",
     [string]$StartUrl = "https://damia.timesheetportal.com/",
     [switch]$KillExisting,
     [switch]$Probe,
@@ -46,8 +50,36 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-if (-not (Test-Path $ChromeExe)) {
-    throw "Chrome not found at: $ChromeExe  (pass -ChromeExe to override)"
+function Resolve-ChromeExe {
+    param([string]$Explicit)
+    if ($Explicit) { return $Explicit }
+
+    $candidates = @()
+    # Registry App Paths first (works wherever Chrome registered itself).
+    foreach ($root in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe')) {
+        try {
+            $p = (Get-ItemProperty -Path $root -ErrorAction Stop).'(default)'
+            if ($p) { $candidates += $p }
+        } catch { }
+    }
+    # Then the common install locations (64-bit, 32-bit, per-user).
+    if ($env:ProgramFiles)        { $candidates += (Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe') }
+    if (${env:ProgramFiles(x86)}) { $candidates += (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe') }
+    if ($env:LOCALAPPDATA)        { $candidates += (Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe') }
+
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path $c)) { return $c }
+    }
+    return $null
+}
+
+$ChromeExe = Resolve-ChromeExe -Explicit $ChromeExe
+if (-not $ChromeExe -or -not (Test-Path $ChromeExe)) {
+    throw ("Could not find chrome.exe automatically. Pass -ChromeExe 'C:\path\to\chrome.exe'. " +
+           "Looked in the registry App Paths and Program Files / Program Files (x86) / LocalAppData.")
 }
 
 if ($KillExisting) {
