@@ -88,7 +88,7 @@ approval:
 
 ## The weekly loop
 
-Run from the repo root with Chrome (CDP) + classic Outlook open. `--week` accepts any date in the target week; it defaults to today's week, so for the week just gone pass e.g. `--week 2026-06-07`.
+Run from the repo root with Chrome (CDP) + classic Outlook open. `--week` accepts any date in the target week and **defaults to the previous (just-completed) week** — the one you've just worked and are submitting — so a bare command does the right thing on Monday. Pass `--week <date>` for any other week. (Damia's "current period" is the week *about to start*; you submit the one that just ended.)
 
 | # | Command | What it does |
 |---|---------|--------------|

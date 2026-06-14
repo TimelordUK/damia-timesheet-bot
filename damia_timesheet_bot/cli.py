@@ -85,6 +85,15 @@ def cmd_view(args: argparse.Namespace) -> int:
     return 0
 
 
+def _target_week(args: argparse.Namespace) -> date:
+    """The week a command operates on. `--week` accepts any date in the target week; with no
+    --week we default to the PREVIOUS (just-completed) week — the one you've just worked and
+    are submitting — not the current in-progress week."""
+    if args.week:
+        return sunday_of(date.fromisoformat(args.week))
+    return sunday_of(date.today()) - timedelta(days=7)
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     """Create the data root + a config.yml template (and the cache/proofs folders). Safe to
     run repeatedly — never overwrites an existing config."""
@@ -125,8 +134,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
         return 2
     holidays = UkGovUkHolidayProvider(cache_dir=paths.root / "holidays")
 
-    anchor = date.fromisoformat(args.week) if args.week else date.today()
-    week_start = sunday_of(anchor)
+    week_start = _target_week(args)
     plan = build_week_plan(week_start, holidays, leave)
 
     # Portal truth (cached) + email-side overlay — both read-only local files.
@@ -211,8 +219,7 @@ def cmd_fill_draft(args: argparse.Namespace) -> int:
         return 2
     holidays = UkGovUkHolidayProvider(cache_dir=paths.root / "holidays")
 
-    anchor = date.fromisoformat(args.week) if args.week else date.today()
-    week_start = sunday_of(anchor)
+    week_start = _target_week(args)
     plan = build_week_plan(week_start, holidays, leave)
     submission = JsonSubmissionStore(paths.submissions_json).get_by_week(week_start)
 
@@ -260,8 +267,7 @@ def cmd_draft(args: argparse.Namespace) -> int:
         return 2
 
     holidays = UkGovUkHolidayProvider(cache_dir=paths.root / "holidays")
-    anchor = date.fromisoformat(args.week) if args.week else date.today()
-    week_start = sunday_of(anchor)
+    week_start = _target_week(args)
     plan = build_week_plan(week_start, holidays, leave)
     store = JsonSubmissionStore(paths.submissions_json)
     submission = store.get_by_week(week_start)
@@ -337,8 +343,7 @@ def cmd_attach_proof(args: argparse.Namespace) -> int:
         print(f"Config error: {e}", file=sys.stderr)
         return 2
 
-    anchor = date.fromisoformat(args.week) if args.week else date.today()
-    week_start = sunday_of(anchor)
+    week_start = _target_week(args)
     store = JsonSubmissionStore(paths.submissions_json)
     sub = store.get_by_week(week_start)
 
@@ -491,12 +496,12 @@ def main(argv: list[str] | None = None) -> int:
     v.set_defaults(func=cmd_view)
 
     pl = sub.add_parser("plan", help="Show the planned week (leave + bank holidays); no I/O.")
-    pl.add_argument("--week", help="Any date (YYYY-MM-DD) in the target week. Default: today.")
+    pl.add_argument("--week", help="Any date (YYYY-MM-DD) in the target week. Default: the previous (just-worked) week.")
     pl.set_defaults(func=cmd_plan)
 
     fd = sub.add_parser("fill-draft",
                         help="Fill a week per the plan and Save draft (never submits).")
-    fd.add_argument("--week", help="Any date (YYYY-MM-DD) in the target week. Default: today.")
+    fd.add_argument("--week", help="Any date (YYYY-MM-DD) in the target week. Default: the previous (just-worked) week.")
     fd.add_argument("--cdp-url", default=DEFAULT_CDP_URL)
     fd.add_argument("--dry-run", action="store_true",
                     help="Read + decide only; make no changes.")
@@ -504,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
 
     dr = sub.add_parser("draft",
                         help="Fill the week + draft the approval email in Outlook (never sends).")
-    dr.add_argument("--week", help="Any date (YYYY-MM-DD) in the target week. Default: today.")
+    dr.add_argument("--week", help="Any date (YYYY-MM-DD) in the target week. Default: the previous (just-worked) week.")
     dr.add_argument("--cdp-url", default=DEFAULT_CDP_URL)
     dr.add_argument("--dry-run", action="store_true",
                     help="Fill + screenshot + show the email, but don't touch Outlook.")
@@ -514,7 +519,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ap = sub.add_parser("attach-proof",
                         help="Upload a week's approval-proof PNG to Damia Attachments (no submit).")
-    ap.add_argument("--week", help="Any date (YYYY-MM-DD) in the target week. Default: today.")
+    ap.add_argument("--week", help="Any date (YYYY-MM-DD) in the target week. Default: the previous (just-worked) week.")
     ap.add_argument("--file", help="Attach this file instead of the week's approval proof.")
     ap.add_argument("--cdp-url", default=DEFAULT_CDP_URL)
     ap.add_argument("--dry-run", action="store_true", help="Locate + report only; upload nothing.")
