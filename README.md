@@ -53,9 +53,13 @@ uv run playwright install chromium   # needed for rendering the approval-proof P
 
 The email subsystem talks to **classic Outlook via COM** (new Outlook has no COM). Open classic Outlook signed in to the mailbox you send from — on the work PC that's your work Exchange account.
 
-### 4. Edit your config
+### 4. Create + edit your config
 
-First run scaffolds `%LOCALAPPDATA%\damia-timesheet-bot\config.yml`. Edit it:
+```powershell
+uv run damia-bot init        # creates %LOCALAPPDATA%\damia-timesheet-bot\ + a config.yml template
+```
+
+(Any command scaffolds the config on first run, but `init` does just that and prints the path.) Then edit it:
 
 ```yaml
 name: Stephen James
@@ -102,8 +106,8 @@ Most write commands take `--dry-run` (decide/preview, change nothing) — use it
 
 ### Your work-PC run, step by step
 
-1. **Hydrate:** `uv run damia-bot hydrate` — builds the cache from the portal.
-2. **Set the approver:** edit `config.yml` → `approver_emails` to your actual manager(s).
+1. **Init + set the approver:** `uv run damia-bot init`, then edit `config.yml` → `name` + `approver_emails` (your actual manager).
+2. **Hydrate:** `uv run damia-bot hydrate` — builds the cache from the portal.
 3. **Draft:** `uv run damia-bot draft --week <date>` → open Outlook Drafts, check it, **send**.
 4. **After your manager replies:** `uv run damia-bot watch` → generates the proof and flips the week to APPROVED. (Check the proof under `…\damia-timesheet-bot\proofs\`.)
 5. **Attach:** `uv run damia-bot attach-proof --week <date>` → proof attached + draft saved.

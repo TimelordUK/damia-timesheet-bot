@@ -85,6 +85,27 @@ def cmd_view(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_init(args: argparse.Namespace) -> int:
+    """Create the data root + a config.yml template (and the cache/proofs folders). Safe to
+    run repeatedly — never overwrites an existing config."""
+    paths = DataPaths.resolve(args.data_dir)
+    try:
+        config, scaffolded = load_or_scaffold(paths.config_file)
+    except ConfigError as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        return 2
+    paths.ensure_cache()
+    paths.ensure_proofs()
+
+    print(f">>> {'Created' if scaffolded else 'Found existing'} config: {paths.config_file}")
+    print(f"    Data root: {paths.root}")
+    if config.is_placeholder:
+        print("\n    Next: edit the config — set `name` and your real `approver_emails` —")
+        print("    then run `damia-bot hydrate`.")
+        print(f"\n    notepad {paths.config_file}")
+    return 0
+
+
 def cmd_plan(args: argparse.Namespace) -> int:
     """Read-only: show what the bot WOULD put on the timesheet for a week, and the approval
     subject it would draft. No portal, no Outlook — pure leave + bank-holiday logic."""
@@ -454,6 +475,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--data-dir",
                    help=r"Override data root (default %%LOCALAPPDATA%%\damia-timesheet-bot). Dev: ./state")
     sub = p.add_subparsers(dest="command", required=True)
+
+    i = sub.add_parser("init", help="Create the data root + config.yml template, then exit.")
+    i.set_defaults(func=cmd_init)
 
     h = sub.add_parser("hydrate", help="Rebuild the cache + view.json by walking the portal.")
     h.add_argument("--cdp-url", default=DEFAULT_CDP_URL)
