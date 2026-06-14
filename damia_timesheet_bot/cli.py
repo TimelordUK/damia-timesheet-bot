@@ -244,6 +244,10 @@ def cmd_draft(args: argparse.Namespace) -> int:
     plan = build_week_plan(week_start, holidays, leave)
     store = JsonSubmissionStore(paths.submissions_json)
     submission = store.get_by_week(week_start)
+    # --force lets us regenerate a week already in flight: ignore its in-flight submission for
+    # the decision and delete the stale Outlook draft before re-drafting.
+    superseding = bool(args.force and submission is not None and submission.status.is_in_flight)
+    decision_sub = None if superseding else submission
 
     print(f"Week {plan.week_start} – {plan.week_end}: plan = {plan.billable_days} day(s)")
     if plan.billable_days == 0:
@@ -251,7 +255,7 @@ def cmd_draft(args: argparse.Namespace) -> int:
         return 0
 
     with DamiaTimesheetDriver(cdp_url=args.cdp_url).attached() as drv:
-        decision, rec = _navigate_decide_fill(drv, plan, submission, do_fill=not args.dry_run)
+        decision, rec = _navigate_decide_fill(drv, plan, decision_sub, do_fill=not args.dry_run)
         if rec is not None:
             print(f"  live portal: {rec.status}  units="
                   f"{','.join(f'{u:g}' for u in rec.day_units)}")
@@ -260,7 +264,9 @@ def cmd_draft(args: argparse.Namespace) -> int:
             print(">>> Not READY_TO_DRAFT — no email drafted, no changes made.")
             return 0 if decision.kind is DecisionKind.NOTHING_TO_DO else 1
 
-        png = drv.screenshot_timesheet()
+        # Full-page capture of the portal — same context as the downloaded proofs
+        # (name, date range, Timesheet Id, status, grid).
+        png = drv.screenshot_week()
 
     tracking_id = new_tracking_id(date.today())
     subject = approval_subject(plan, tracking_id)
@@ -279,7 +285,11 @@ def cmd_draft(args: argparse.Namespace) -> int:
         print(">>> --dry-run: would create the above as an Outlook DRAFT. Outlook untouched.")
         return 0
 
-    entry_id = OutlookComEmailDriver().connect().draft_submission_email(
+    email_drv = OutlookComEmailDriver().connect()
+    if superseding:
+        removed = email_drv.delete_drafts_by_tracking_id(submission.tracking_id)
+        print(f"  superseded prior draft {submission.tracking_id} (removed {removed}).")
+    entry_id = email_drv.draft_submission_email(
         to=approvers, subject=subject, body_html=body, attachment_png=png,
         tracking_id=tracking_id,
     )
@@ -399,6 +409,8 @@ def main(argv: list[str] | None = None) -> int:
     dr.add_argument("--cdp-url", default=DEFAULT_CDP_URL)
     dr.add_argument("--dry-run", action="store_true",
                     help="Fill + screenshot + show the email, but don't touch Outlook.")
+    dr.add_argument("--force", action="store_true",
+                    help="Re-draft a week already in flight: delete the stale draft and redo.")
     dr.set_defaults(func=cmd_draft)
 
     w = sub.add_parser("watch",

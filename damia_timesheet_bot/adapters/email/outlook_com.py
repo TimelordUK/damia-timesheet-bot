@@ -152,6 +152,26 @@ class OutlookComEmailDriver:
                     out.append(it.EntryID)
         return out
 
+    def delete_drafts_by_tracking_id(self, tracking_id: str) -> int:
+        """Delete any Drafts-folder messages carrying this tracking id (used when re-drafting
+        a week). Returns how many were removed."""
+        drafts = self._ns().GetDefaultFolder(16)  # olFolderDrafts
+        items = drafts.Items
+        victims = []
+        try:
+            dasl = f"@SQL=\"urn:schemas:httpmail:subject\" LIKE '%{tracking_id}%'"
+            victims = list(items.Restrict(dasl))
+        except Exception:
+            victims = [it for it in items if tracking_id in (getattr(it, "Subject", "") or "")]
+        n = 0
+        for it in victims:
+            try:
+                it.Delete()
+                n += 1
+            except Exception:
+                pass
+        return n
+
     def reply_summary(self, message_id: str) -> dict:
         """Lightweight, classify-ready view of a message. `body` is plain text (for the
         classifier); `is_reply` flags an actual RE: reply vs our own original."""
