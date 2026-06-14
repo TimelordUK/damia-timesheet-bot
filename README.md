@@ -35,7 +35,8 @@ The **portal is the source of truth**; `cache/` is disposable and rebuilt by `hy
 # from the repo root
 uv venv
 uv sync
-uv run playwright install chromium   # needed for rendering the approval-proof PNG
+uv run playwright install chromium   # OPTIONAL fallback — proof rendering normally uses your
+                                     # running Chrome over CDP (skip if the download is blocked)
 ```
 
 > **Behind a corporate proxy?** If `uv sync` fails with TLS/certificate errors, allow the
@@ -106,7 +107,7 @@ Run from the repo root with Chrome (CDP) + classic Outlook open. `--week` accept
 | 5 | `uv run damia-bot attach-proof --week <date>` | Upload the approval proof to the Damia **Attachments** panel and click **Save draft**. **Never Submits.** |
 | — | *You* do the final **Submit** to the agency. | |
 
-Helpers: `damia-bot view` (print `view.json`), `damia-bot tui` (Textual dashboard), `damia-bot fill-draft` (fill + Save draft only, no email).
+Helpers: `damia-bot view` (print `view.json`), `damia-bot tui` (Textual dashboard), `damia-bot fill-draft` (fill + Save draft only, no email), `damia-bot render-test` (verify proof rendering).
 
 Most write commands take `--dry-run` (decide/preview, change nothing) — use it first when in doubt.
 
@@ -141,7 +142,13 @@ package hosts explicitly:
 uv sync --allow-insecure-host github.com --allow-insecure-host pypi.org --allow-insecure-host files.pythonhosted.org
 ```
 
-(Equivalently, set `UV_INSECURE_HOST="github.com pypi.org files.pythonhosted.org"` so you don't repeat the flags. `uv run playwright install chromium` downloads its browser from a separate CDN; if that step is blocked, point Node at the CA with `$env:NODE_EXTRA_CA_CERTS = "C:\path\to\corporate-root-ca.pem"`.)
+(Equivalently, set `UV_INSECURE_HOST="github.com pypi.org files.pythonhosted.org"` so you don't repeat the flags.)
+
+**Proof rendering needs no Chromium download.** `watch` renders the approval-proof PNG through your *already-running* Chrome over CDP, so the (often-blocked) `playwright install chromium` step is optional. Verify rendering works on this machine — with Chrome launched via `launch-chrome.ps1` — using:
+
+```powershell
+uv run damia-bot render-test
+```
 
 ## If the portal looks reskinned
 

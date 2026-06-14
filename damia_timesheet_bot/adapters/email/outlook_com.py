@@ -188,10 +188,12 @@ class OutlookComEmailDriver:
             "is_reply": subject.strip().lower().startswith("re:"),
         }
 
-    def render_proof(self, message_id: str, out_path) -> Path:
+    def render_proof(self, message_id: str, out_path, *, cdp_url: str | None = None) -> Path:
         """Render an approval reply (its 'Approved' + the quoted request + the embedded
         timesheet screenshot) to a single proof PNG, wrapped with the same metadata header the
-        agency is used to. Inline images are saved and their cid: refs rewritten to files."""
+        agency is used to. Inline images are saved and their cid: refs rewritten to files.
+
+        cdp_url (if given) renders via the already-running Chrome — no Chromium download."""
         item = self._ns().GetItemFromID(message_id)
         out_path = Path(out_path)
         with tempfile.TemporaryDirectory() as td:
@@ -214,7 +216,7 @@ class OutlookComEmailDriver:
                     body_html = body_html.replace(f"cid:{cid}", fn).replace(f"cid:<{cid}>", fn)
 
             (tdp / "index.html").write_text(self._proof_html(item, body_html), encoding="utf-8")
-            render_html_dir_to_png(tdp, "index.html", out_path)
+            render_html_dir_to_png(tdp, "index.html", out_path, cdp_url=cdp_url)
         return out_path
 
     def _proof_html(self, item, body_html: str) -> str:

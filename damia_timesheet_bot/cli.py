@@ -405,6 +405,32 @@ def cmd_attach_proof(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_render_test(args: argparse.Namespace) -> int:
+    """Render a tiny sample proof to confirm proof-rendering works on this machine — useful on
+    a corporate box where the Chromium download is blocked but Chrome is up on CDP."""
+    import tempfile
+    from pathlib import Path
+
+    from .adapters.render import render_html_dir_to_png
+
+    paths = DataPaths.resolve(args.data_dir)
+    paths.ensure_proofs()
+    out = paths.proofs_dir / "_render_test.png"
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        (tdp / "index.html").write_text(
+            "<!doctype html><html><head><meta charset='utf-8'><style>"
+            "body{font-family:Calibri,Arial,sans-serif;margin:24px}h1{color:#1e57b0}</style>"
+            "</head><body><h1>damia-timesheet-bot — render test</h1>"
+            "<p>If you can read this PNG, approval-proof rendering works here "
+            "(via your running Chrome over CDP — no Chromium download needed).</p>"
+            "</body></html>", encoding="utf-8")
+        render_html_dir_to_png(tdp, "index.html", out, cdp_url=args.cdp_url)
+    print(f">>> Rendered test image to {out} ({out.stat().st_size} bytes).")
+    print("    If that worked, `watch` will render real approval proofs the same way.")
+    return 0
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Check in-flight submissions for an approval reply. On a clean 'Approved' reply, render
     the proof PNG and advance the week to APPROVED. A non-approval reply (a query) flags the
@@ -450,7 +476,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                       f"{out.name} (dry-run).")
                 continue
             paths.ensure_proofs()
-            drv.render_proof(approved["entry_id"], out)
+            drv.render_proof(approved["entry_id"], out, cdp_url=args.cdp_url)
             store.mark_status(s.tracking_id, SubmissionStatus.APPROVED)
             print(f"  APPROVED by {approved['sender_smtp']} ({approved['received']}).")
             print(f"  proof: {out}")
@@ -532,9 +558,16 @@ def main(argv: list[str] | None = None) -> int:
     w = sub.add_parser("watch",
                        help="Check in-flight submissions for approval replies; render proofs.")
     w.add_argument("--weeks", type=int, default=12, help="How far back to consider (default 12).")
+    w.add_argument("--cdp-url", default=DEFAULT_CDP_URL,
+                   help="Render the proof via this running Chrome (no Chromium download).")
     w.add_argument("--dry-run", action="store_true",
                    help="Classify + report only; render no proof, change no state.")
     w.set_defaults(func=cmd_watch)
+
+    rt = sub.add_parser("render-test",
+                        help="Render a sample proof to check proof-rendering works on this box.")
+    rt.add_argument("--cdp-url", default=DEFAULT_CDP_URL)
+    rt.set_defaults(func=cmd_render_test)
 
     t = sub.add_parser("tui", help="Launch the Textual TUI (reads view.json).")
     t.set_defaults(func=cmd_tui)
