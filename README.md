@@ -164,6 +164,13 @@ All selectors are centralised as `SEL_*` / `FMT_*` constants at the top of `adap
 
 ## Roadmap
 
-- **Orchestrator / `--bot` mode:** a single command you spin up (e.g. Monday morning) that runs the whole loop unattended — hydrate, draft (pause for your send), poll `watch` until approved, attach the proof — stopping at the two human gates (sending the email, the final Submit) and flagging anything off the standard path for manual handling.
+*(Held until the basic loop is proven end-to-end against a real manager reply.)*
+
+- **Outlook-calendar leave** adapter (swap-in behind the existing `LeaveProvider` port): read holiday blocks straight from the Outlook calendar — e.g. a 2-week block makes those weeks 0-day, so the bot knows it must **not** draft or submit hours over that period. Removes the need to hand-maintain the `leave:` ledger.
+- **TUI privacy + status dashboard:** the TUI is a placeholder today. Before use at work it needs a **safe mode** that hides the money figures by default (reveal on a keypress), and it becomes the at-a-glance **state board** for bot mode (see below).
+- **Orchestrator / `--bot` mode — prepare/watch/alert only, never the outward sends.** The two outward actions stay **permanently human-gated**: the bot must **never email the manager** and **never Submit to the agency** — an accidental extra day (e.g. a Saturday) must be caught by a human before it ever reaches the boss. In bot mode the loop runs unattended *up to* those gates and surfaces state in the TUI:
+  - *draft staged, not sent* — review & send yourself
+  - *awaiting approval — N hours, no reply*
+  - *manager replied with a question → needs attention* (not a clean approval)
+  - *approved → proof downloaded + attached, pending your Submit*
 - **Delta hydration:** re-sweep status every run but reuse cached artifacts for settled weeks (`--full` to force a full rebuild).
-- **Outlook-calendar leave** adapter (swap-in for the config ledger).
