@@ -40,6 +40,14 @@ leave: []
 #     end: 2026-12-31
 #     type: annual
 
+# How to recognise a manager's approval reply. Conservative on purpose: a reply is only an
+# approval if, once quoted history is stripped, it is SHORT (<= max_words) and contains an
+# approval keyword. Anything longer (e.g. "did you not take Monday off?") is treated as a
+# query and the week is flagged for manual handling — the bot never assumes.
+approval:
+  keywords: [approved, approve, approval, ok, okay, yes, agreed, confirmed, fine]
+  max_words: 2
+
 # Optional: contract periods (for revenue grouping / sanity checks). Rate may change per job.
 # job_periods:
 #   - name: "ACME"
@@ -63,6 +71,7 @@ class Config:
     week_start: str = "sunday"
     approver_emails: list[str] = field(default_factory=list)
     leave: list[dict] = field(default_factory=list)
+    approval: dict = field(default_factory=dict)
     job_periods: list[dict] = field(default_factory=list)
 
     @property
@@ -80,6 +89,7 @@ class Config:
                 week_start=str(data.get("week_start", "sunday")),
                 approver_emails=list(data.get("approver_emails") or []),
                 leave=list(data.get("leave") or []),
+                approval=dict(data.get("approval") or {}),
                 job_periods=list(data.get("job_periods") or []),
             )
         except KeyError as e:

@@ -17,20 +17,22 @@ try:
 except Exception:
     pass
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
+from .adapters.email.outlook_com import SCREENSHOT_CID, OutlookComEmailDriver
 from .adapters.holidays.uk_govuk import UkGovUkHolidayProvider
 from .adapters.leave.config_ledger import ConfigLeaveProvider
 from .adapters.state.csv_cache import CsvWeekCache
 from .adapters.state.submission_store import JsonSubmissionStore
 from .adapters.timesheet.damia_playwright import DEFAULT_CDP_URL, DamiaTimesheetDriver
+from .core.classify import ApprovalConfig
 from .core.config import ConfigError, load_or_scaffold
-from .core.decide import DecisionKind, decide_week
+from .core.decide import Decision, DecisionKind, decide_week
 from .core.hydrate import build_view, hydrate, write_view
-from .core.models import Day, Week, WeekRecord
+from .core.models import Day, Submission, SubmissionStatus, Week, WeekRecord
 from .core.paths import DataPaths
 from .core.tracking import new_tracking_id
-from .core.weekplan import approval_subject, build_week_plan, sunday_of
+from .core.weekplan import approval_body_html, approval_subject, build_week_plan, sunday_of
 
 
 def cmd_hydrate(args: argparse.Namespace) -> int:
@@ -136,6 +138,44 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _units_match(a, b) -> bool:
+    return len(a) == len(b) and all(round(x, 2) == round(y, 2) for x, y in zip(a, b))
+
+
+def _read_live_record(drv, plan) -> WeekRecord:
+    live = drv.read_week()
+    return WeekRecord(
+        week_start=plan.week_start, week_end=plan.week_end, status=drv.status_word(),
+        total_units=live.total_units, worked_days=live.worked_days,
+        day_units=tuple(d.units for d in live.days),
+    )
+
+
+def _navigate_decide_fill(drv, plan, submission, *, do_fill: bool):
+    """Navigate to the plan's week, decide against the LIVE portal, and (if do_fill and the
+    decision is READY and the sheet isn't already correct) fill per the plan + Save draft.
+    Returns (decision, live_record_after). Mutates only on READY_TO_DRAFT."""
+    drv.navigate_to_week(plan.week_start)
+    landed = drv.current_week_range()[0]
+    if landed != plan.week_start:
+        return (Decision(DecisionKind.MANUAL_INTERVENTION, plan.week_start,
+                         f"driver landed on {landed}, not {plan.week_start}."), None)
+
+    rec = _read_live_record(drv, plan)
+    decision = decide_week(plan, rec, submission)
+
+    if do_fill and decision.kind is DecisionKind.READY_TO_DRAFT \
+            and not _units_match(rec.day_units, plan.day_units):
+        week = Week(start=plan.week_start, days=[
+            Day(date=plan.week_start + timedelta(days=i), units=plan.day_units[i])
+            for i in range(7)
+        ])
+        drv.fill_week(week)
+        drv.save_draft()
+        rec = _read_live_record(drv, plan)
+    return decision, rec
+
+
 def cmd_fill_draft(args: argparse.Namespace) -> int:
     """Fill the timesheet for a week per the plan and SAVE A DRAFT. Never submits.
 
@@ -162,39 +202,95 @@ def cmd_fill_draft(args: argparse.Namespace) -> int:
         return 0
 
     with DamiaTimesheetDriver(cdp_url=args.cdp_url).attached() as drv:
-        drv.navigate_to_week(week_start)
-        if drv.current_week_range()[0] != week_start:
-            print(f"[abort] driver landed on {drv.current_week_range()[0]}, not {week_start}.",
-                  file=sys.stderr)
-            return 1
-        live = drv.read_week()
-        live_record = WeekRecord(
-            week_start=week_start, week_end=plan.week_end, status=drv.status_word(),
-            total_units=live.total_units, worked_days=live.worked_days,
-            day_units=tuple(d.units for d in live.days),
-        )
-        decision = decide_week(plan, live_record, submission)
-        print(f"  live portal: {live_record.status}  units="
-              f"{','.join(f'{u:g}' for u in live_record.day_units)}")
+        decision, rec = _navigate_decide_fill(drv, plan, submission, do_fill=not args.dry_run)
+        if rec is not None:
+            print(f"  live portal: {rec.status}  units="
+                  f"{','.join(f'{u:g}' for u in rec.day_units)}")
         print(f"  decision   : {decision.kind.value} — {decision.reason}")
 
         if decision.kind is not DecisionKind.READY_TO_DRAFT:
             print(">>> Not READY_TO_DRAFT — no changes made.")
             return 0 if decision.kind is DecisionKind.NOTHING_TO_DO else 1
-
         if args.dry_run:
-            print(">>> --dry-run: would fill the above plan and Save draft (not submit). "
-                  "No changes made.")
+            print(">>> --dry-run: would fill the plan and Save draft (not submit). No changes.")
             return 0
+        print(f">>> Filled and saved DRAFT. Portal now: {rec.status}  "
+              f"{rec.total_units:g} day(s). (Never submitted.)")
+    return 0
 
-        week = Week(start=week_start, days=[
-            Day(date=week_start + timedelta(days=i), units=plan.day_units[i]) for i in range(7)
-        ])
-        drv.fill_week(week)
-        drv.save_draft()
-        after = drv.read_week()
-        print(f">>> Filled and saved DRAFT. Portal now: {drv.status_word()}  "
-              f"{after.total_units:g} day(s). (Never submitted.)")
+
+def cmd_draft(args: argparse.Namespace) -> int:
+    """Prepare a week (fill+save draft) AND draft the approval email into Outlook Drafts with
+    the timesheet screenshot embedded. NEVER sends. Records an EMAIL_DRAFTED submission so the
+    week can never be re-drafted (anti-spam). `--dry-run` does everything except touch Outlook."""
+    paths = DataPaths.resolve(args.data_dir)
+    try:
+        config, _ = load_or_scaffold(paths.config_file)
+        leave = ConfigLeaveProvider.from_config(config)
+    except ConfigError as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        return 2
+    if config.is_placeholder:
+        print("[abort] config.yml is still the template — set your name first.", file=sys.stderr)
+        return 2
+    approvers = [a for a in config.approver_emails if a and "example.com" not in a]
+    if not approvers:
+        print("[abort] no real approver_emails in config.yml.", file=sys.stderr)
+        return 2
+
+    holidays = UkGovUkHolidayProvider(cache_dir=paths.root / "holidays")
+    anchor = date.fromisoformat(args.week) if args.week else date.today()
+    week_start = sunday_of(anchor)
+    plan = build_week_plan(week_start, holidays, leave)
+    store = JsonSubmissionStore(paths.submissions_json)
+    submission = store.get_by_week(week_start)
+
+    print(f"Week {plan.week_start} – {plan.week_end}: plan = {plan.billable_days} day(s)")
+    if plan.billable_days == 0:
+        print(">>> 0 billable days — no email to draft.")
+        return 0
+
+    with DamiaTimesheetDriver(cdp_url=args.cdp_url).attached() as drv:
+        decision, rec = _navigate_decide_fill(drv, plan, submission, do_fill=not args.dry_run)
+        if rec is not None:
+            print(f"  live portal: {rec.status}  units="
+                  f"{','.join(f'{u:g}' for u in rec.day_units)}")
+        print(f"  decision   : {decision.kind.value} — {decision.reason}")
+        if decision.kind is not DecisionKind.READY_TO_DRAFT:
+            print(">>> Not READY_TO_DRAFT — no email drafted, no changes made.")
+            return 0 if decision.kind is DecisionKind.NOTHING_TO_DO else 1
+
+        png = drv.screenshot_timesheet()
+
+    tracking_id = new_tracking_id(date.today())
+    subject = approval_subject(plan, tracking_id)
+    body = approval_body_html(plan, config.name, SCREENSHOT_CID)
+
+    paths.ensure_proofs()
+    shot_path = paths.proofs_dir / f"request_{week_start.isoformat()}_{tracking_id.split('-')[-1]}.png"
+    shot_path.write_bytes(png)
+
+    print(f"  tracking id: {tracking_id}")
+    print(f"  to         : {', '.join(approvers)}")
+    print(f"  subject    : {subject}")
+    print(f"  screenshot : {shot_path}  ({len(png)} bytes)")
+
+    if args.dry_run:
+        print(">>> --dry-run: would create the above as an Outlook DRAFT. Outlook untouched.")
+        return 0
+
+    entry_id = OutlookComEmailDriver().connect().draft_submission_email(
+        to=approvers, subject=subject, body_html=body, attachment_png=png,
+        tracking_id=tracking_id,
+    )
+    now = datetime.now()
+    store.put(Submission(
+        tracking_id=tracking_id, week_start=week_start, status=SubmissionStatus.EMAIL_DRAFTED,
+        created_at=now, updated_at=now, approver_emails=approvers,
+        timesheet_screenshot_path=shot_path,
+    ))
+    print(f">>> Created Outlook DRAFT (EntryID {entry_id[:12]}…) in your Drafts folder. "
+          f"Review and send it yourself — the bot never sends.")
     return 0
 
 
@@ -234,6 +330,14 @@ def main(argv: list[str] | None = None) -> int:
     fd.add_argument("--dry-run", action="store_true",
                     help="Read + decide only; make no changes.")
     fd.set_defaults(func=cmd_fill_draft)
+
+    dr = sub.add_parser("draft",
+                        help="Fill the week + draft the approval email in Outlook (never sends).")
+    dr.add_argument("--week", help="Any date (YYYY-MM-DD) in the target week. Default: today.")
+    dr.add_argument("--cdp-url", default=DEFAULT_CDP_URL)
+    dr.add_argument("--dry-run", action="store_true",
+                    help="Fill + screenshot + show the email, but don't touch Outlook.")
+    dr.set_defaults(func=cmd_draft)
 
     t = sub.add_parser("tui", help="Launch the Textual TUI (reads view.json).")
     t.set_defaults(func=cmd_tui)

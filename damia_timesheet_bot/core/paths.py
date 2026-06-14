@@ -48,6 +48,15 @@ class DataPaths:
         drafted/sent (and the tracking-ids we issued)."""
         return self.root / "submissions.json"
 
+    @property
+    def proofs_dir(self) -> Path:
+        """Evidence artifacts (request screenshots, approval-proof PNGs). PRECIOUS — the agency
+        only pays against the approval proof — so outside the disposable cache/."""
+        return self.root / "proofs"
+
+    def ensure_proofs(self) -> None:
+        self.proofs_dir.mkdir(parents=True, exist_ok=True)
+
     # --- disposable cache -----------------------------------------------------
     @property
     def cache_dir(self) -> Path:

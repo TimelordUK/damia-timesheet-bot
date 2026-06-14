@@ -88,6 +88,28 @@ def approval_subject(plan: WeekPlan, tracking_id: str) -> str:
     return "".join(parts)
 
 
+def approval_body_html(plan: WeekPlan, contractor_name: str, cid: str) -> str:
+    """The approval-request email body, with the timesheet screenshot referenced inline by
+    content-id (`cid`). Pure text; the email adapter attaches the actual image under that cid."""
+    n = plan.billable_days
+    day_word = "day" if n == 1 else "days"
+    excl = ""
+    if plan.bank_holidays:
+        items = "; ".join(f"{_dmy(b.date)} ({b.label})" for b in plan.bank_holidays)
+        excl = f" (excluding bank holiday {items})"
+    return (
+        '<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt">'
+        "<p>Hi,</p>"
+        f"<p>Please could you approve my timesheet for "
+        f"<b>{_dmy(plan.week_start)} &#8211; {_dmy(plan.week_end)}</b> &#8211; "
+        f"<b>{n} {day_word}</b>{excl}.</p>"
+        "<p>Screenshot for reference:</p>"
+        f'<p><img src="cid:{cid}" style="border:1px solid #ccc"></p>'
+        f"<p>Thanks,<br>{contractor_name}</p>"
+        "</div>"
+    )
+
+
 def sunday_of(d: date) -> date:
     """The Damia week-start (Sunday) for the week containing `d`. Python weekday(): Mon=0..Sun=6,
     so days since the most recent Sunday is (weekday()+1) % 7."""

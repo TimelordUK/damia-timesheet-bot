@@ -467,6 +467,22 @@ class DamiaTimesheetDriver:
         except Exception:
             return self.page.screenshot(full_page=False, timeout=5000)
 
+    def screenshot_timesheet(self, bring_to_front: bool = True) -> bytes:
+        """Screenshot just the timesheet panel (#MainContent_tblSubmit_{tid}) — a clean image
+        of the week's grid + date header, without the surrounding browser/portal chrome.
+        Falls back to a full-page screenshot if the panel can't be isolated."""
+        if bring_to_front:
+            try:
+                self.page.bring_to_front()
+                self.page.wait_for_timeout(300)
+            except Exception:
+                pass
+        try:
+            loc = self.page.locator(f"#MainContent_tblSubmit_{self.timesheet_id}")
+            return loc.screenshot(timeout=10000)
+        except Exception:
+            return self.screenshot_week(bring_to_front=False)
+
     # ---- introspection ----------------------------------------------------
 
     def has_download_button(self) -> bool:
