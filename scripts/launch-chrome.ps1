@@ -83,11 +83,18 @@ if (-not $ChromeExe -or -not (Test-Path $ChromeExe)) {
 }
 
 if ($KillExisting) {
-    $procs = Get-Process chrome -ErrorAction SilentlyContinue
-    if ($procs) {
-        Write-Host "Killing $($procs.Count) existing chrome.exe process(es)..."
-        $procs | Stop-Process -Force
+    # Kill ONLY the Chrome processes launched against our dedicated debug profile — matched by
+    # --user-data-dir in the command line (the browser process and all its children carry it).
+    # Your normal Chrome (default user-data-dir) is left running.
+    $needle = "--user-data-dir=$ProfileDir"
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" -ErrorAction SilentlyContinue |
+               Where-Object { $_.CommandLine -and $_.CommandLine.Contains($needle) })
+    if ($procs.Count -gt 0) {
+        Write-Host "Killing $($procs.Count) debug-profile chrome.exe process(es) (your other Chrome windows are left alone)..."
+        foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
         Start-Sleep -Milliseconds 500
+    } else {
+        Write-Host "No debug-profile Chrome found to kill."
     }
 }
 
