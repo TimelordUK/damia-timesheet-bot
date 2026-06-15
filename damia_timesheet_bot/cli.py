@@ -59,7 +59,8 @@ def cmd_hydrate(args: argparse.Namespace) -> int:
         )
 
     CsvWeekCache(paths.csv_path).write(records)
-    view = build_view(records, config, paths)
+    subs, billable = _state_inputs(paths, config, records)
+    view = build_view(records, config, paths, submissions=subs, billable_by_week=billable)
     write_view(view, paths.view_json)
 
     s = view["stats"]
@@ -92,6 +93,62 @@ def _target_week(args: argparse.Namespace) -> date:
     if args.week:
         return sunday_of(date.fromisoformat(args.week))
     return sunday_of(date.today()) - timedelta(days=7)
+
+
+def _state_inputs(paths: DataPaths, config, records: list):
+    """(submissions_by_week, billable_days_by_week) for state reconciliation. Billable is a
+    best-effort plan computation (gov.uk falls back to the bundled snapshot offline)."""
+    subs = JsonSubmissionStore(paths.submissions_json).all_by_week()
+    billable: dict = {}
+    try:
+        leave = ConfigLeaveProvider.from_config(config)
+        holidays = UkGovUkHolidayProvider(cache_dir=paths.root / "holidays")
+        billable = {r.week_start: build_week_plan(r.week_start, holidays, leave).billable_days
+                    for r in records}
+    except Exception:
+        pass
+    return subs, billable
+
+
+def _rebuild_view(paths: DataPaths, config) -> dict | None:
+    """Recompute cache/view.json from the portal cache + submission overlay (no portal/Outlook
+    I/O). Returns the view, or None if there's no cache yet."""
+    records = CsvWeekCache(paths.csv_path).read()
+    if not records:
+        return None
+    subs, billable = _state_inputs(paths, config, records)
+    view = build_view(records, config, paths, submissions=subs, billable_by_week=billable)
+    write_view(view, paths.view_json)
+    return view
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """The passive bot: reconcile the portal cache + email submissions into a per-week state
+    board and refresh cache/view.json. Read-only (no portal, no Outlook)."""
+    paths = DataPaths.resolve(args.data_dir)
+    try:
+        config, _ = load_or_scaffold(paths.config_file)
+    except ConfigError as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        return 2
+    view = _rebuild_view(paths, config)
+    if view is None:
+        print("No cache yet — run `hydrate` first.", file=sys.stderr)
+        return 2
+
+    focus = view.get("focus")
+    weeks = view.get("weeks", [])
+    print(f"State board  ({len(weeks)} weeks; focus = {focus or 'none'})\n")
+    for w in weeks[-args.weeks:]:
+        mark = ">>" if w["week_start"] == focus else "  "
+        print(f"{mark} {w['week_start']}  {w['state_label']:<32} [{w['state']}]")
+    if focus:
+        fw = next((w for w in weeks if w["week_start"] == focus), None)
+        if fw and fw.get("events"):
+            print(f"\nFocus week {focus} — timeline:")
+            for e in fw["events"]:
+                print(f"   {e.get('when') or '':16} {e['text']}")
+    return 0
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -490,6 +547,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
                   f"needs_attention.")
             print(f"    {verdict.reason}")
             print(f"    reply text: {verdict.cleaned[:120]!r}")
+
+    _rebuild_view(paths, config)  # refresh the state board after any updates
     return 0
 
 
@@ -520,6 +579,11 @@ def main(argv: list[str] | None = None) -> int:
 
     v = sub.add_parser("view", help="Print the current view.json.")
     v.set_defaults(func=cmd_view)
+
+    st = sub.add_parser("status",
+                        help="Passive bot: derive per-week state from cache + submissions.")
+    st.add_argument("--weeks", type=int, default=8, help="How many recent weeks to show.")
+    st.set_defaults(func=cmd_status)
 
     pl = sub.add_parser("plan", help="Show the planned week (leave + bank holidays); no I/O.")
     pl.add_argument("--week", help="Any date (YYYY-MM-DD) in the target week. Default: the previous (just-worked) week.")

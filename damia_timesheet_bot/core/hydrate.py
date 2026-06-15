@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Callable
 from .config import Config
 from .models import WeekRecord
 from .paths import DataPaths
+from .state import derive_events, reconcile_week_state, state_label, state_tone, WeekState
 
 if TYPE_CHECKING:
     from .ports import TimesheetDriver
@@ -126,8 +127,19 @@ def _derive_actions(records: list[WeekRecord]) -> list[dict]:
     return actions
 
 
-def build_view(records: list[WeekRecord], config: Config, paths: DataPaths) -> dict:
+def build_view(
+    records: list[WeekRecord],
+    config: Config,
+    paths: DataPaths,
+    *,
+    submissions: dict | None = None,
+    billable_by_week: dict | None = None,
+    now: datetime | None = None,
+) -> dict:
     rate = config.day_rate
+    submissions = submissions or {}
+    billable_by_week = billable_by_week or {}
+    now = now or datetime.now()
     weeks: list[dict] = []
     total_units = 0.0
     total_rev = 0.0
@@ -144,6 +156,13 @@ def build_view(records: list[WeekRecord], config: Config, paths: DataPaths) -> d
             approved_rev += rev
         else:
             pending_rev += rev
+
+        sub = submissions.get(r.week_start)
+        state = reconcile_week_state(
+            portal=r, submission=sub, now=now,
+            billable_days=billable_by_week.get(r.week_start),
+        )
+        events = derive_events(r, sub)
         weeks.append({
             "week_start": r.week_start.isoformat(),
             "week_end": r.week_end.isoformat(),
@@ -153,7 +172,22 @@ def build_view(records: list[WeekRecord], config: Config, paths: DataPaths) -> d
             "revenue": rev,
             "pdf": r.pdf_path.name if r.pdf_path else None,
             "attachments": [p.name for p in r.attachment_paths],
+            "state": state.value,
+            "state_label": state_label(state),
+            "state_tone": state_tone(state),
+            "tracking_id": sub.tracking_id if sub else None,
+            "events": [{"when": e.when.isoformat(timespec="minutes") if e.when else None,
+                        "text": e.text} for e in events],
         })
+
+    # 'focus' = the most recent week still needing a human (else the latest week) — the "Now" tab.
+    focus = None
+    for w in reversed(weeks):
+        if WeekState(w["state"]).needs_human:
+            focus = w
+            break
+    if focus is None and weeks:
+        focus = weeks[-1]
 
     generated = records[0].hydrated_at if records and records[0].hydrated_at else datetime.now()
     return {
@@ -174,6 +208,7 @@ def build_view(records: list[WeekRecord], config: Config, paths: DataPaths) -> d
             "weeks_by_status": by_status,
         },
         "weeks": weeks,
+        "focus": focus["week_start"] if focus else None,
         "actions": _derive_actions(records),
     }
 

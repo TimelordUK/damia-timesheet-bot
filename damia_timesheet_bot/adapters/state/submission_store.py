@@ -80,6 +80,9 @@ class JsonSubmissionStore:
     def get_by_week(self, week_start: date) -> Submission | None:
         return self._load().get(week_start)
 
+    def all_by_week(self) -> dict[date, Submission]:
+        return self._load()
+
     def put(self, submission: Submission) -> None:
         by_week = self._load()
         by_week[submission.week_start] = submission
