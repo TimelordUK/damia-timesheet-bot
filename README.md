@@ -107,9 +107,18 @@ Run from the repo root with Chrome (CDP) + classic Outlook open. `--week` accept
 | 5 | `uv run damia-bot attach-proof --week <date>` | Upload the approval proof to the Damia **Attachments** panel and click **Save draft**. **Never Submits.** |
 | — | *You* do the final **Submit** to the agency. | |
 
-Helpers: `damia-bot view` (print `view.json`), `damia-bot tui` (Textual dashboard), `damia-bot fill-draft` (fill + Save draft only, no email), `damia-bot render-test` (verify proof rendering).
+Helpers: `damia-bot status` (state board — see below), `damia-bot view` (print `view.json`), `damia-bot tui` (state board, below), `damia-bot fill-draft` (fill + Save draft only, no email), `damia-bot render-test` (verify proof rendering).
 
 Most write commands take `--dry-run` (decide/preview, change nothing) — use it first when in doubt.
+
+### State board (`status` / `tui`)
+
+The bot is **passive**: it reconciles the portal cache + your email submissions into one derived state per week — `DRAFTED_IN_OUTLOOK → SENT_FOR_APPROVAL → MGR_APPROVED → ATTACHED → SUBMITTED → DAMIA_APPROVED` (plus `NO_RESPONSE`, `MGR_QUERY`, `DAMIA_REJECTED`). It never sends and never submits — it just tells you where each week stands.
+
+- `uv run damia-bot status` — prints the board + the focus week's timeline (and refreshes `view.json`).
+- `uv run damia-bot tui` — the same as a live dashboard with three tabs: **Now** (focus week: state + event timeline), **History** (every week + state), **Money** (revenue — **hidden by default**; press `m` to reveal). `r` refreshes, `q` quits.
+
+State is derived from the cache + submissions, so after `hydrate`/`draft`/`watch`/`attach-proof` it updates automatically. Agency-side state (`SUBMITTED`/`DAMIA_APPROVED`) comes from the portal, so re-run `hydrate` to pick up the agency's decision.
 
 ### Your work-PC run, step by step
 
@@ -167,10 +176,7 @@ All selectors are centralised as `SEL_*` / `FMT_*` constants at the top of `adap
 *(Held until the basic loop is proven end-to-end against a real manager reply.)*
 
 - **Outlook-calendar leave** adapter (swap-in behind the existing `LeaveProvider` port): read holiday blocks straight from the Outlook calendar — e.g. a 2-week block makes those weeks 0-day, so the bot knows it must **not** draft or submit hours over that period. Removes the need to hand-maintain the `leave:` ledger.
-- **TUI privacy + status dashboard:** the TUI is a placeholder today. Before use at work it needs a **safe mode** that hides the money figures by default (reveal on a keypress), and it becomes the at-a-glance **state board** for bot mode (see below).
-- **Orchestrator / `--bot` mode — prepare/watch/alert only, never the outward sends.** The two outward actions stay **permanently human-gated**: the bot must **never email the manager** and **never Submit to the agency** — an accidental extra day (e.g. a Saturday) must be caught by a human before it ever reaches the boss. In bot mode the loop runs unattended *up to* those gates and surfaces state in the TUI:
-  - *draft staged, not sent* — review & send yourself
-  - *awaiting approval — N hours, no reply*
-  - *manager replied with a question → needs attention* (not a clean approval)
-  - *approved → proof downloaded + attached, pending your Submit*
+- **TUI privacy + status dashboard — DONE (passive).** Three tabs (Now / History / Money), money hidden by default (`m` to reveal), live state board. See [State board](#state-board-status--tui).
+- **Passive state engine — DONE.** `WeekState` + `status`/`tui` derive where each week stands from the cache + submissions.
+- **Active `--bot` mode (next) — prepare/watch/alert only, never the outward sends.** The two outward actions stay **permanently human-gated**: the bot must **never email the manager** and **never Submit to the agency** — an accidental extra day (e.g. a Saturday) must be caught by a human before it reaches the boss. The active bot would *poll* on a timer (detect the send → `SENT_FOR_APPROVAL`, watch for the reply, flag `NO_RESPONSE` after N hours, render+attach on approval) and surface alerts in the TUI — but stop dead at the send and the Submit.
 - **Delta hydration:** re-sweep status every run but reuse cached artifacts for settled weeks (`--full` to force a full rebuild).
