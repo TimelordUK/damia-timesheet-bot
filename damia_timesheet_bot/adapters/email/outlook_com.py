@@ -15,6 +15,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from ..render import render_html_dir_to_png
@@ -29,6 +30,7 @@ _PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
 _OL_MAIL_ITEM = 0
 _OL_BY_VALUE = 1
 _OL_FOLDER_INBOX = 6
+_OL_FOLDER_SENT = 5
 
 
 def _safe_name(name: str) -> str:
@@ -151,6 +153,46 @@ class OutlookComEmailDriver:
                 if tracking_id in (getattr(it, "Subject", "") or ""):
                     out.append(it.EntryID)
         return out
+
+    @staticmethod
+    def _pytime_to_dt(when) -> datetime | None:
+        """Convert a pywintypes time (Outlook SentOn/ReceivedTime) to a naive local datetime —
+        consistent with the datetime.now() stamps the submission store uses elsewhere."""
+        if when is None:
+            return None
+        try:
+            return datetime(when.year, when.month, when.day,
+                            when.hour, when.minute, when.second)
+        except Exception:
+            return None
+
+    def find_sent_original(self, tracking_id: str) -> datetime | None:
+        """If the ORIGINAL approval request bearing this tracking id is now in the Sent folder,
+        return when it was sent (naive local), else None. Replies (RE:) are excluded so only the
+        user's outgoing request counts — this is how the bot learns the draft has actually been
+        sent to the manager, without ever sending anything itself."""
+        sent = self._ns().GetDefaultFolder(_OL_FOLDER_SENT)
+        items = sent.Items
+        candidates: list = []
+        try:
+            dasl = f"@SQL=\"urn:schemas:httpmail:subject\" LIKE '%{tracking_id}%'"
+            candidates = list(items.Restrict(dasl))
+        except Exception:
+            items.Sort("[SentOn]", True)
+            for n, it in enumerate(items):
+                if n > 300:
+                    break
+                if tracking_id in (getattr(it, "Subject", "") or ""):
+                    candidates.append(it)
+        best: datetime | None = None
+        for it in candidates:
+            subj = (getattr(it, "Subject", "") or "").strip().lower()
+            if subj.startswith("re:"):
+                continue  # a reply we sent, not the original request
+            ts = self._pytime_to_dt(getattr(it, "SentOn", None))
+            if ts and (best is None or ts > best):
+                best = ts
+        return best
 
     def delete_drafts_by_tracking_id(self, tracking_id: str) -> int:
         """Delete any Drafts-folder messages carrying this tracking id (used when re-drafting

@@ -489,9 +489,11 @@ def cmd_render_test(args: argparse.Namespace) -> int:
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
-    """Check in-flight submissions for an approval reply. On a clean 'Approved' reply, render
-    the proof PNG and advance the week to APPROVED. A non-approval reply (a query) flags the
-    week needs_attention. Read-only against Outlook except writing proofs + state."""
+    """Passive Outlook sweep over in-flight weeks. For a still-drafted week, detect whether it
+    has been sent (original in the Sent folder) and advance it to AWAITING_APPROVAL. For a sent
+    week, look for the reply: a clean 'Approved' renders the proof PNG and advances to APPROVED;
+    a non-approval reply (a query) flags needs_attention. Never sends; only writes proofs +
+    state."""
     paths = DataPaths.resolve(args.data_dir)
     try:
         config, _ = load_or_scaffold(paths.config_file)
@@ -509,6 +511,23 @@ def cmd_watch(args: argparse.Namespace) -> int:
     drv = OutlookComEmailDriver().connect()
     for s in inflight:
         print(f"\n{s.week_start}  {s.tracking_id}  ({s.status.value})")
+
+        # First, learn whether a still-drafted week has actually been sent to the manager.
+        # Finding the original request in the Sent folder flips it to AWAITING_APPROVAL, which
+        # lights up SENT_FOR_APPROVAL (then NO_RESPONSE past the threshold) on the state board.
+        if s.status is SubmissionStatus.EMAIL_DRAFTED:
+            sent_at = drv.find_sent_original(s.tracking_id)
+            if sent_at is None:
+                print("  not sent yet — draft still sitting in Outlook Drafts.")
+                continue
+            if args.dry_run:
+                print(f"  detected SENT at {sent_at} — would mark awaiting approval (dry-run).")
+                continue
+            store.mark_status(s.tracking_id, SubmissionStatus.AWAITING_APPROVAL, when=sent_at)
+            s.status = SubmissionStatus.AWAITING_APPROVAL
+            s.updated_at = sent_at
+            print(f"  detected SENT at {sent_at} -> awaiting approval.")
+
         replies = [r for r in (drv.reply_summary(mid)
                                for mid in drv.find_by_tracking_id(s.tracking_id))
                    if r["is_reply"]]
@@ -620,7 +639,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.set_defaults(func=cmd_attach_proof)
 
     w = sub.add_parser("watch",
-                       help="Check in-flight submissions for approval replies; render proofs.")
+                       help="Detect sends + approval replies for in-flight weeks; render proofs.")
     w.add_argument("--weeks", type=int, default=12, help="How far back to consider (default 12).")
     w.add_argument("--cdp-url", default=DEFAULT_CDP_URL,
                    help="Render the proof via this running Chrome (no Chromium download).")

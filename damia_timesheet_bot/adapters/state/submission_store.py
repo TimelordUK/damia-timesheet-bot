@@ -93,12 +93,16 @@ class JsonSubmissionStore:
         subs = [s for s in self._load().values() if s.week_start >= cutoff]
         return sorted(subs, key=lambda s: s.week_start)
 
-    def mark_status(self, tracking_id: str, status: SubmissionStatus) -> None:
+    def mark_status(self, tracking_id: str, status: SubmissionStatus,
+                    when: datetime | None = None) -> None:
+        """Advance a submission's status. `when` stamps updated_at (defaults to now) — sent-
+        detection passes the real SentOn time so the NO_RESPONSE clock counts from the actual
+        send, not from when the bot happened to notice it."""
         by_week = self._load()
         for wk, sub in by_week.items():
             if sub.tracking_id == tracking_id:
                 sub.status = status
-                sub.updated_at = datetime.now()
+                sub.updated_at = when or datetime.now()
                 self._save(by_week)
                 return
         raise KeyError(f"No submission with tracking_id {tracking_id!r}")

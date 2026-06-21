@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -76,6 +76,11 @@ class EmailDriver(Protocol):
         """Return message ids that reference this tracking id (in subject or body)."""
         ...
 
+    def find_sent_original(self, tracking_id: str) -> datetime | None:
+        """Return when the original approval request for this tracking id was sent, if it's now
+        in the Sent folder; else None. How the bot detects the user has sent the draft."""
+        ...
+
     def extract_approval(self, message_id: str) -> ApprovalRecord | None:
         """If the message is an approval, extract the embedded image to disk and return the record."""
         ...
@@ -94,4 +99,5 @@ class StateStore(Protocol):
     def get_by_week(self, week_start: date) -> Submission | None: ...
     def put(self, submission: Submission) -> None: ...
     def list_recent(self, weeks: int) -> list[Submission]: ...
-    def mark_status(self, tracking_id: str, status: SubmissionStatus) -> None: ...
+    def mark_status(self, tracking_id: str, status: SubmissionStatus,
+                    when: datetime | None = None) -> None: ...
