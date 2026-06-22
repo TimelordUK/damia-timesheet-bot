@@ -493,7 +493,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
     has been sent (original in the Sent folder) and advance it to AWAITING_APPROVAL. For a sent
     week, look for the reply: a clean 'Approved' renders the proof PNG and advances to APPROVED;
     a non-approval reply (a query) flags needs_attention. Never sends; only writes proofs +
-    state."""
+    state. `--week DATE` targets one week; `--force` also re-processes a SETTLED week (re-render
+    a bad proof) without regressing its status — pair with `attach-proof --replace` to redo."""
     paths = DataPaths.resolve(args.data_dir)
     try:
         config, _ = load_or_scaffold(paths.config_file)
@@ -503,13 +504,27 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     store = JsonSubmissionStore(paths.submissions_json)
     approval_cfg = ApprovalConfig.from_dict(config.approval)
-    inflight = [s for s in store.list_recent(weeks=args.weeks) if s.status.is_in_flight]
-    if not inflight:
-        print("No in-flight submissions to check.")
+
+    if args.week:
+        target = _target_week(args)
+        one = store.get_by_week(target)
+        candidates = [one] if one is not None else []
+        if not candidates:
+            print(f"No submission recorded for {target}.")
+            return 0
+    else:
+        candidates = store.list_recent(weeks=args.weeks)
+
+    # Normally we only touch in-flight weeks. --force also re-processes a SETTLED week (e.g. to
+    # re-render a bad proof and re-attach) — it never regresses that week's recorded status.
+    work = candidates if args.force else [s for s in candidates if s.status.is_in_flight]
+    if not work:
+        hint = "" if args.force else "  (use --force --week DATE to re-process a settled week.)"
+        print("No in-flight submissions to check." + hint)
         return 0
 
     drv = OutlookComEmailDriver().connect()
-    for s in inflight:
+    for s in work:
         print(f"\n{s.week_start}  {s.tracking_id}  ({s.status.value})")
 
         # First, learn whether a still-drafted week has actually been sent to the manager.
@@ -553,15 +568,25 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 continue
             paths.ensure_proofs()
             drv.render_proof(approved["entry_id"], out, cdp_url=args.cdp_url)
-            store.mark_status(s.tracking_id, SubmissionStatus.APPROVED)
             print(f"  APPROVED by {approved['sender_smtp']} ({approved['received']}).")
             print(f"  proof: {out}")
-            print("  -> upload this to the Damia week's Attachments tab (manual final step).")
+            if s.status.is_in_flight:
+                store.mark_status(s.tracking_id, SubmissionStatus.APPROVED)
+                print("  -> upload this to the Damia week's Attachments tab (manual final step).")
+            else:
+                # forced re-render of a settled week — don't regress its status.
+                print(f"  re-rendered (status left at {s.status.value}).")
+                print(f"  -> re-attach with: damia-bot attach-proof --week {s.week_start} "
+                      f"--replace")
         else:
             r, verdict = others[-1]
-            if not args.dry_run:
+            if args.dry_run:
+                verb = "would mark"
+            elif s.status.is_in_flight:
                 store.mark_status(s.tracking_id, SubmissionStatus.NEEDS_ATTENTION)
-            verb = "would mark" if args.dry_run else "marked"
+                verb = "marked"
+            else:
+                verb = "left"  # forced re-check of a settled week — don't regress
             print(f"  reply from {r['sender_smtp']} is NOT a clean approval — {verb} "
                   f"needs_attention.")
             print(f"    {verdict.reason}")
@@ -641,6 +666,9 @@ def main(argv: list[str] | None = None) -> int:
     w = sub.add_parser("watch",
                        help="Detect sends + approval replies for in-flight weeks; render proofs.")
     w.add_argument("--weeks", type=int, default=12, help="How far back to consider (default 12).")
+    w.add_argument("--week", help="Only this week (any date in it). Use with --force to redo.")
+    w.add_argument("--force", action="store_true",
+                   help="Re-process a SETTLED week too (re-render its proof); never regresses state.")
     w.add_argument("--cdp-url", default=DEFAULT_CDP_URL,
                    help="Render the proof via this running Chrome (no Chromium download).")
     w.add_argument("--dry-run", action="store_true",

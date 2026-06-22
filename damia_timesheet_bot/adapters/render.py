@@ -28,14 +28,30 @@ def render_html_dir_to_png(html_dir: Path, index_name: str, out_path: Path,
         if cdp_url:
             try:
                 browser = pw.chromium.connect_over_cdp(cdp_url)
-                ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+                # A dedicated 2x context renders a CRISP proof. The user's existing context has
+                # a fixed device-pixel-ratio we can't change, so reusing it (the old behaviour)
+                # produced a low-res image. Make our own 2x context and tear it down after;
+                # fall back to the default context if CDP refuses a new one.
+                own_ctx = False
+                try:
+                    ctx = browser.new_context(viewport={"width": width, "height": 1400},
+                                              device_scale_factor=2)
+                    own_ctx = True
+                except Exception:
+                    ctx = browser.contexts[0] if browser.contexts else browser.new_context()
                 page = ctx.new_page()
                 try:
-                    page.set_viewport_size({"width": width, "height": 1400})
+                    if not own_ctx:
+                        page.set_viewport_size({"width": width, "height": 1400})
                     page.goto(index_uri, wait_until="networkidle")
                     page.screenshot(path=str(out_path), full_page=True)
                 finally:
                     page.close()  # close only our tab; never the user's browser
+                    if own_ctx:
+                        try:
+                            ctx.close()
+                        except Exception:
+                            pass
                 return out_path
             except Exception:
                 pass  # CDP not reachable / blocked — fall back to a headless launch
