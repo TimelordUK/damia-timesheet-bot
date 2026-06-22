@@ -730,6 +730,18 @@ class DamiaTimesheetDriver:
                 pass
         return False
 
+    def reload_and_count_attachments(self, week_start: date) -> int:
+        """Hard-reload the page, re-navigate to `week_start`, and return how many SERVER-
+        PERSISTED attachments the week has (signed CDN URLs only — a freshly-picked file that
+        was never saved server-side won't have one). Used to VERIFY an upload actually stuck:
+        the in-memory panel can keep showing a file that a reload reveals was never saved."""
+        self.page.reload(wait_until="domcontentloaded", timeout=20000)
+        self.page.wait_for_selector("[id^='tsEntriesWrapper_']", timeout=15000)
+        self._refresh_timesheet_id()
+        self.navigate_to_week(week_start)
+        self.open_attachments_tab()
+        return len(self.attachment_urls())
+
     def download_week_pdf(self, save_to) -> object:
         """Click the Download button and capture the PDF that Damia produces. Refuses on
         Drafts that don't have a download button. Returns the saved Path."""

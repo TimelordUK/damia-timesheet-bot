@@ -76,6 +76,28 @@ function Resolve-ChromeExe {
     return $null
 }
 
+function Reset-CleanExit {
+    # After a forced kill, Chrome's profile is flagged as having crashed, so the next launch
+    # reopens the previous tabs ("restore pages?"). Stamp a clean exit + disable session restore
+    # so we get ONE fresh tab (the StartUrl) instead. Only safe to touch when no debug-profile
+    # Chrome is running (we call this right after KillExisting).
+    param([string]$ProfileDir)
+    $prefs = Join-Path $ProfileDir 'Default\Preferences'
+    if (-not (Test-Path $prefs)) { return }
+    try {
+        $j = Get-Content $prefs -Raw | ConvertFrom-Json -AsHashtable
+        if (-not $j.ContainsKey('profile')) { $j['profile'] = @{} }
+        $j['profile']['exit_type'] = 'Normal'
+        $j['profile']['exited_cleanly'] = $true
+        if (-not $j.ContainsKey('session')) { $j['session'] = @{} }
+        $j['session']['restore_on_startup'] = 1   # 1 = New Tab page; do NOT restore last session
+        ($j | ConvertTo-Json -Depth 100 -Compress) | Set-Content -Path $prefs -Encoding UTF8 -NoNewline
+        Write-Host "Reset clean-exit flags (no tab restore on launch)."
+    } catch {
+        Write-Host "  (could not reset clean-exit flags: $($_.Exception.Message))"
+    }
+}
+
 $ChromeExe = Resolve-ChromeExe -Explicit $ChromeExe
 if (-not $ChromeExe -or -not (Test-Path $ChromeExe)) {
     throw ("Could not find chrome.exe automatically. Pass -ChromeExe 'C:\path\to\chrome.exe'. " +
@@ -96,6 +118,9 @@ if ($KillExisting) {
     } else {
         Write-Host "No debug-profile Chrome found to kill."
     }
+    # The kill marks the profile as crashed; stamp a clean exit so we don't get the previous
+    # tabs restored on relaunch.
+    Reset-CleanExit -ProfileDir $ProfileDir
 }
 
 # Detect the "default profile + flag silently ignored" case before launching.
@@ -116,6 +141,9 @@ Write-Host "  startUrl:   $StartUrl"
 Start-Process -FilePath $ChromeExe -ArgumentList @(
     "--remote-debugging-port=$Port",
     "--user-data-dir=$ProfileDir",
+    "--hide-crash-restore-bubble",   # belt-and-braces: never show the "restore pages?" bubble
+    "--no-first-run",
+    "--no-default-browser-check",
     $StartUrl
 )
 

@@ -439,23 +439,42 @@ def cmd_attach_proof(args: argparse.Namespace) -> int:
             existing = drv.attachment_urls()
         except Exception:
             pass
+        before_count = len(existing)
+
+        uploaded = False
         if existing and not args.replace:
-            print(f"  {len(existing)} attachment(s) already on this week — skipping upload "
+            print(f"  {before_count} attachment(s) already on this week — skipping upload "
                   f"(use --replace to add another).")
-            ok = True
         else:
-            ok = drv.upload_attachment(proof)
-            if not ok:
+            if not drv.upload_attachment(proof):
                 print(">>> Upload did not confirm within the timeout — check the portal "
                       "manually.", file=sys.stderr)
                 return 1
+            uploaded = True
 
         saved = False
         if not args.no_save:
             drv.save_draft()   # bottom-left Save draft — NEVER Submit
             saved = True
 
-    if sub is not None:
+        # Verify the upload actually PERSISTED. The panel can keep showing a freshly-picked
+        # file that a reload reveals was never saved server-side (the silent failure seen on
+        # the corporate portal). Reload + recount signed attachments before trusting it.
+        if uploaded and saved:
+            try:
+                after_count = drv.reload_and_count_attachments(week_start)
+            except Exception as e:
+                print(f">>> Could NOT verify the attachment after reload ({e}). Check the "
+                      f"portal — it may not have saved. Proof: {proof}", file=sys.stderr)
+                return 1
+            if after_count <= before_count:
+                print(f">>> VERIFY FAILED: after reload the week still has {after_count} "
+                      f"attachment(s) — the upload did NOT persist. Nothing marked done.\n"
+                      f"    Attach it by hand from: {proof}", file=sys.stderr)
+                return 1
+            print(f"  verified: {after_count} attachment(s) now persisted on the week.")
+
+    if sub is not None and (saved or args.no_save):
         store.mark_status(sub.tracking_id, SubmissionStatus.SENT_TO_PORTAL)
     tail = "and Saved the draft" if saved else "(draft NOT saved — use without --no-save)"
     print(f">>> Proof attached {tail}. Submit was NOT clicked — do the final submit yourself.")
@@ -493,8 +512,10 @@ def cmd_watch(args: argparse.Namespace) -> int:
     has been sent (original in the Sent folder) and advance it to AWAITING_APPROVAL. For a sent
     week, look for the reply: a clean 'Approved' renders the proof PNG and advances to APPROVED;
     a non-approval reply (a query) flags needs_attention. Never sends; only writes proofs +
-    state. `--week DATE` targets one week; `--force` also re-processes a SETTLED week (re-render
-    a bad proof) without regressing its status — pair with `attach-proof --replace` to redo."""
+    state. `--week DATE` targets one week; `--force` (no week) redoes ONLY the latest week and
+    re-renders its proof without regressing status. Weeks the agency already has
+    (submitted/approved/rejected) are skipped — too late to redo. Pair with
+    `attach-proof --replace` to re-attach."""
     paths = DataPaths.resolve(args.data_dir)
     try:
         config, _ = load_or_scaffold(paths.config_file)
@@ -504,28 +525,42 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     store = JsonSubmissionStore(paths.submissions_json)
     approval_cfg = ApprovalConfig.from_dict(config.approval)
+    portal_status = {r.week_start: (r.status or "").lower()
+                     for r in CsvWeekCache(paths.csv_path).read()}
+    _AGENCY_TERMINAL = {"approved", "submitted", "rejected"}
 
     if args.week:
         target = _target_week(args)
         one = store.get_by_week(target)
-        candidates = [one] if one is not None else []
-        if not candidates:
+        if one is None:
             print(f"No submission recorded for {target}.")
             return 0
+        work = [one]
+    elif args.force:
+        # Force without a week redoes ONLY the most recent week — not a sweep of older,
+        # already-settled weeks (which would needlessly re-touch accepted timesheets).
+        recent = store.list_recent(weeks=args.weeks)
+        work = [max(recent, key=lambda s: s.week_start)] if recent else []
+        if not work:
+            print("No submissions to redo.")
+            return 0
     else:
-        candidates = store.list_recent(weeks=args.weeks)
-
-    # Normally we only touch in-flight weeks. --force also re-processes a SETTLED week (e.g. to
-    # re-render a bad proof and re-attach) — it never regresses that week's recorded status.
-    work = candidates if args.force else [s for s in candidates if s.status.is_in_flight]
-    if not work:
-        hint = "" if args.force else "  (use --force --week DATE to re-process a settled week.)"
-        print("No in-flight submissions to check." + hint)
-        return 0
+        work = [s for s in store.list_recent(weeks=args.weeks) if s.status.is_in_flight]
+        if not work:
+            print("No in-flight submissions to check.  "
+                  "(use --force [--week DATE] to redo the latest / a specific week.)")
+            return 0
 
     drv = OutlookComEmailDriver().connect()
     for s in work:
         print(f"\n{s.week_start}  {s.tracking_id}  ({s.status.value})")
+
+        # Once the agency already has the week (submitted/approved/rejected) there's nothing to
+        # redo — re-rendering or re-attaching is pointless, so skip it loudly.
+        if portal_status.get(s.week_start) in _AGENCY_TERMINAL:
+            print(f"  already '{portal_status[s.week_start]}' at the agency — too late to redo. "
+                  f"Skipping.")
+            continue
 
         # First, learn whether a still-drafted week has actually been sent to the manager.
         # Finding the original request in the Sent folder flips it to AWAITING_APPROVAL, which
@@ -668,7 +703,8 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--weeks", type=int, default=12, help="How far back to consider (default 12).")
     w.add_argument("--week", help="Only this week (any date in it). Use with --force to redo.")
     w.add_argument("--force", action="store_true",
-                   help="Re-process a SETTLED week too (re-render its proof); never regresses state.")
+                   help="Redo the latest week (or --week) even if settled; skips weeks the agency "
+                        "already has. Never regresses state.")
     w.add_argument("--cdp-url", default=DEFAULT_CDP_URL,
                    help="Render the proof via this running Chrome (no Chromium download).")
     w.add_argument("--dry-run", action="store_true",
