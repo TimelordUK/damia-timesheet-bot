@@ -6,6 +6,7 @@ own __doPostBack JS. NEVER clicks Submit. NEVER clicks Cancel timesheet.
 """
 from __future__ import annotations
 
+import base64
 import json as _json
 import re
 from contextlib import contextmanager
@@ -458,6 +459,35 @@ class DamiaTimesheetDriver:
 
     # ---- screenshot -------------------------------------------------------
 
+    def _capture_fullpage_hidpi(self, scale: int = 2) -> bytes | None:
+        """Full-page screenshot of the attached tab at `scale`x resolution via raw CDP. Uses
+        Page.captureScreenshot with clip.scale so we get a crisp image WITHOUT changing the
+        tab's device metrics (the user's live Damia view isn't reflowed). Returns None on any
+        failure so the caller can fall back to a normal 1x Playwright screenshot — we're driving
+        the user's own Chrome over CDP, whose device-pixel-ratio is 1, hence the low-res default.
+        """
+        try:
+            cdp = self.page.context.new_cdp_session(self.page)
+            try:
+                metrics = cdp.send("Page.getLayoutMetrics")
+                size = metrics.get("cssContentSize") or metrics.get("contentSize")
+                if not size:
+                    return None
+                shot = cdp.send("Page.captureScreenshot", {
+                    "format": "png",
+                    "captureBeyondViewport": True,
+                    "clip": {"x": 0, "y": 0, "width": size["width"],
+                             "height": size["height"], "scale": scale},
+                })
+                return base64.b64decode(shot["data"])
+            finally:
+                try:
+                    cdp.detach()
+                except Exception:
+                    pass
+        except Exception:
+            return None
+
     def screenshot_week(self, bring_to_front: bool = True) -> bytes:
         if bring_to_front:
             try:
@@ -465,6 +495,9 @@ class DamiaTimesheetDriver:
                 self.page.wait_for_timeout(300)
             except Exception:
                 pass
+        hi = self._capture_fullpage_hidpi(scale=2)
+        if hi is not None:
+            return hi
         try:
             return self.page.screenshot(full_page=True, timeout=10000)
         except Exception:
