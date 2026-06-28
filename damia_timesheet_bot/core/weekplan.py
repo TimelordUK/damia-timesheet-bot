@@ -88,26 +88,30 @@ def approval_subject(plan: WeekPlan, tracking_id: str) -> str:
     return "".join(parts)
 
 
+# Max on-screen width (CSS px) for the inline timesheet image. Kept well inside a typical
+# Outlook compose pane so the Word engine never zooms the whole message down to fit a wide image.
+_EMAIL_IMG_MAX_W = 680
+
+
 def approval_body_html(plan: WeekPlan, contractor_name: str, cid: str,
                        img_width: int | None = None) -> str:
     """The approval-request email body, with the timesheet screenshot referenced inline by
     content-id (`cid`). Pure text; the email adapter attaches the actual image under that cid.
 
-    The screenshot is captured at 2x device pixels for crispness, so it must be displayed at
-    its *logical* width (half the pixels) — otherwise Outlook renders it at full pixel size and
-    it overflows the compose frame. Pass `img_width` (the logical CSS width in px); falls back
-    to fitting the frame when unknown."""
+    The screenshot is captured at 2x device pixels for crispness. Outlook's Word engine ignores
+    `max-width` and sizes the image purely from the `width` attribute — and uses that to set the
+    document width, then zooms the WHOLE message (text included) to fit the compose pane. So we
+    must cap the displayed width to something that fits a normal pane (`_EMAIL_IMG_MAX_W`); the
+    2x source keeps it crisp even when downscaled. Pass `img_width` (the logical CSS width)."""
     n = plan.billable_days
     day_word = "day" if n == 1 else "days"
     excl = ""
     if plan.bank_holidays:
         items = "; ".join(f"{_dmy(b.date)} ({b.label})" for b in plan.bank_holidays)
         excl = f" (excluding bank holiday {items})"
-    if img_width:
-        img = (f'<img src="cid:{cid}" width="{img_width}" '
-               f'style="width:{img_width}px;max-width:100%;height:auto;border:1px solid #ccc">')
-    else:
-        img = f'<img src="cid:{cid}" style="max-width:100%;height:auto;border:1px solid #ccc">'
+    w = min(img_width, _EMAIL_IMG_MAX_W) if img_width else _EMAIL_IMG_MAX_W
+    img = (f'<img src="cid:{cid}" width="{w}" '
+           f'style="width:{w}px;max-width:100%;height:auto;border:1px solid #ccc">')
     return (
         '<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt">'
         "<p>Hi,</p>"
