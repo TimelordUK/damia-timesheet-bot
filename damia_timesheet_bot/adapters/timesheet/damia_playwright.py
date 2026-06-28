@@ -473,6 +473,9 @@ class DamiaTimesheetDriver:
                 size = metrics.get("cssContentSize") or metrics.get("contentSize")
                 if not size:
                     return None
+                # Remember the LOGICAL (CSS) width so the email can display the 2x-density PNG at
+                # its intended size instead of full pixel size (which overflows the compose frame).
+                self.last_screenshot_css_width = int(size["width"])
                 shot = cdp.send("Page.captureScreenshot", {
                     "format": "png",
                     "captureBeyondViewport": True,
@@ -489,6 +492,9 @@ class DamiaTimesheetDriver:
             return None
 
     def screenshot_week(self, bring_to_front: bool = True) -> bytes:
+        # Reset so a 1x fallback (which already yields a logical-size PNG) leaves this None and
+        # the email falls back to frame-fitting rather than an over-small fixed width.
+        self.last_screenshot_css_width: int | None = None
         if bring_to_front:
             try:
                 self.page.bring_to_front()

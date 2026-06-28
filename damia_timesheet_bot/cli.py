@@ -351,10 +351,11 @@ def cmd_draft(args: argparse.Namespace) -> int:
         # Full-page capture of the portal — same context as the downloaded proofs
         # (name, date range, Timesheet Id, status, grid).
         png = drv.screenshot_week()
+        img_width = getattr(drv, "last_screenshot_css_width", None)
 
     tracking_id = new_tracking_id(date.today())
     subject = approval_subject(plan, tracking_id)
-    body = approval_body_html(plan, config.name, SCREENSHOT_CID)
+    body = approval_body_html(plan, config.name, SCREENSHOT_CID, img_width=img_width)
 
     paths.ensure_proofs()
     shot_path = paths.proofs_dir / f"request_{week_start.isoformat()}_{tracking_id.split('-')[-1]}.png"

@@ -88,6 +88,7 @@ class OutlookComEmailDriver:
             except com_error:
                 pass  # worst case the image shows as a normal attachment, not inline
             mail.HTMLBody = body_html
+            self._reset_compose_zoom(mail)
 
             self._save_with_retry(mail, pythoncom, com_error)
             return mail.EntryID
@@ -97,6 +98,22 @@ class OutlookComEmailDriver:
                     os.remove(tmp_path)
                 except OSError:
                     pass
+
+    @staticmethod
+    def _reset_compose_zoom(mail, percent: int = 100) -> None:
+        """Force the draft's editor zoom to 100%. Outlook persists the compose-window zoom
+        globally, so a level the user once dialled down (e.g. to tame a previously-oversized
+        image) sticks to every later draft and makes everything look tiny. Setting the
+        WordEditor zoom resets that persisted value. Classic Outlook only — new Outlook exposes
+        no WordEditor — and the WordEditor needs Word as the email editor; swallow anything."""
+        try:
+            inspector = mail.GetInspector
+            doc = inspector.WordEditor  # Word.Document, or None if Word isn't the editor
+            if doc is None:
+                return
+            doc.Windows(1).View.Zoom.Percentage = percent
+        except Exception:
+            pass  # new Outlook / non-Word editor / no GUI — zoom stays as-is, harmless
 
     @staticmethod
     def _save_with_retry(mail, pythoncom, com_error, attempts: int = 3) -> None:
