@@ -574,6 +574,27 @@ def cmd_watch(args: argparse.Namespace) -> int:
         sent_at = drv.find_sent_original(s.tracking_id)
         draft_ids = drv.find_drafts_by_tracking_id(s.tracking_id)
         inbox_ids = drv.find_by_tracking_id(s.tracking_id)
+
+        # Self-heal a drifted tracking id. If the ledger id matches NOTHING in Outlook, the id
+        # was likely rotated by a re-draft (each draft used to mint a fresh random id). Recover
+        # the real one by the week's date-range in the subject — the true join key — and adopt
+        # it, so the scan below runs against the id that was actually sent/approved. Only pay for
+        # the extra range scan in the failure case (everything empty).
+        if not sent_at and not inbox_ids and not draft_ids:
+            week_end = s.week_start + timedelta(days=6)
+            week_range = f"{s.week_start.strftime('%d/%m/%Y')} - {week_end.strftime('%d/%m/%Y')}"
+            found = drv.discover_tracking_id(week_range)
+            if found is not None and found[0] != s.tracking_id:
+                real_id = found[0]
+                print(f"  ledger id {s.tracking_id} not found in Outlook; discovered {real_id} "
+                      f"by week range {week_range!r} -> adopting{' (dry-run)' if args.dry_run else ''}.")
+                if not args.dry_run:
+                    s.tracking_id = real_id
+                    store.put(s)  # rewrite the ledger row (keyed by week_start) with the real id
+                sent_at = drv.find_sent_original(s.tracking_id)
+                draft_ids = drv.find_drafts_by_tracking_id(s.tracking_id)
+                inbox_ids = drv.find_by_tracking_id(s.tracking_id)
+
         replies = [r for r in (drv.reply_summary(mid) for mid in inbox_ids) if r["is_reply"]]
         approved = None
         others: list = []
