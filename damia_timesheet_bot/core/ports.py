@@ -86,6 +86,12 @@ class EmailDriver(Protocol):
         watcher verify a draft physically exists rather than inferring it from ledger status."""
         ...
 
+    def discover_tracking_id(self, week_range: str) -> tuple[str, datetime | None] | None:
+        """Recover the real tracking id for a week from its date-range in the subject (the true
+        join key), returning (tracking_id, when) or None. Repairs a ledger id that drifted after
+        a re-draft rotated it."""
+        ...
+
     def extract_approval(self, message_id: str) -> ApprovalRecord | None:
         """If the message is an approval, extract the embedded image to disk and return the record."""
         ...

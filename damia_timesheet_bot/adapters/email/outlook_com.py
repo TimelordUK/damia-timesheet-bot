@@ -267,19 +267,28 @@ class OutlookComEmailDriver:
         return folders
 
     @staticmethod
-    def _match_by_tracking_id(folder, tracking_id: str, *, cap: int = 500) -> list:
-        """Items in `folder` whose subject contains the tracking id. Tries the fast DASL
-        Restrict first, then ALWAYS falls back to a capped manual scan when Restrict returns
-        nothing — Exchange online can accept the LIKE '%…%' query yet return zero rows because
-        the leading wildcard needs a content index the mailbox may not have (whereas the
-        Gmail/IMAP dev box honours it, which is why this only bites on the work PC)."""
-        items = folder.Items
+    def _match_by_tracking_id(folder, needle: str, *, cap: int = 500) -> list:
+        """Items in `folder` whose subject contains `needle` (a tracking id OR a week-range
+        string — both are just subject substrings). Tries the fast DASL Restrict first, then
+        ALWAYS falls back to a capped manual scan when Restrict returns nothing — Exchange online
+        can accept the LIKE '%…%' query yet return zero rows because the leading wildcard needs a
+        content index the mailbox may not have (the Gmail/IMAP dev box honours it, which is why
+        this only bites on the work PC). Every COM access is defensive: archived/stub items in an
+        Online Archive can raise 'object could not be found' mid-scan, and one bad item must not
+        abort the whole folder."""
+        try:
+            items = folder.Items
+        except Exception:
+            return []
         found: list = []
         seen: set = set()
         try:
-            dasl = f"@SQL=\"urn:schemas:httpmail:subject\" LIKE '%{tracking_id}%'"
+            dasl = f"@SQL=\"urn:schemas:httpmail:subject\" LIKE '%{needle}%'"
             for it in items.Restrict(dasl):
-                eid = getattr(it, "EntryID", None)
+                try:
+                    eid = it.EntryID
+                except Exception:
+                    continue
                 if eid and eid not in seen:
                     seen.add(eid)
                     found.append(it)
@@ -292,14 +301,20 @@ class OutlookComEmailDriver:
                     break
                 except Exception:
                     continue
-            for n, it in enumerate(items):
-                if n > cap:
-                    break
-                if tracking_id in (getattr(it, "Subject", "") or ""):
-                    eid = getattr(it, "EntryID", None)
-                    if eid and eid not in seen:
+            try:
+                for n, it in enumerate(items):
+                    if n > cap:
+                        break
+                    try:
+                        subj = getattr(it, "Subject", "") or ""
+                        eid = it.EntryID
+                    except Exception:
+                        continue  # a stub/archived item that won't materialise — skip it
+                    if needle in subj and eid and eid not in seen:
                         seen.add(eid)
                         found.append(it)
+            except Exception:
+                pass
         return found
 
     def find_by_tracking_id(self, tracking_id: str) -> list[str]:
@@ -322,6 +337,32 @@ class OutlookComEmailDriver:
                     continue  # a reply we're composing, not the original request draft
                 out.append(it.EntryID)
         return out
+
+    def discover_tracking_id(self, week_range: str) -> tuple[str, datetime | None] | None:
+        """Recover the REAL tracking id for a week from its date-range in the subject — the true
+        join key. The [TS:...] id is only a thread correlator and drifts if a week gets re-drafted
+        (each draft mints a fresh random id and overwrites the ledger), so the ledger can end up
+        pointing at an id that was never sent. This scans every account's Sent, then Inbox, for a
+        subject containing `week_range` (e.g. '05/01/2026 - 11/01/2026'), parses the [TS:...] out
+        of the real message, and returns (tracking_id, when) for the most recent match, else None.
+        Sent is searched first so we prefer the original outgoing request's id."""
+        best: tuple[str, datetime | None] | None = None
+        for ftype, timeattr in ((_OL_FOLDER_SENT, "SentOn"), (_OL_FOLDER_INBOX, "ReceivedTime")):
+            for folder in self._default_folders(ftype):
+                for it in self._match_by_tracking_id(folder, week_range):
+                    try:
+                        subj = getattr(it, "Subject", "") or ""
+                    except Exception:
+                        continue
+                    tid = parse_tracking_id(subj)
+                    if not tid:
+                        continue
+                    when = (self._pytime_to_dt(getattr(it, timeattr, None))
+                            or self._pytime_to_dt(getattr(it, "CreationTime", None)))
+                    if best is None or (when is not None
+                                        and (best[1] is None or when > best[1])):
+                        best = (tid, when)
+        return best
 
     @staticmethod
     def _pytime_to_dt(when) -> datetime | None:

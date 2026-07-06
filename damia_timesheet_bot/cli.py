@@ -353,7 +353,11 @@ def cmd_draft(args: argparse.Namespace) -> int:
         png = drv.screenshot_week()
         img_width = getattr(drv, "last_screenshot_css_width", None)
 
-    tracking_id = new_tracking_id(date.today())
+    # The tracking id is a STABLE per-week thread correlator, not a per-attempt value. Reuse the
+    # week's existing id on a re-draft — minting a fresh random one each time (and overwriting the
+    # ledger) orphaned the already-sent/approved email, which still carries the old id, so `watch`
+    # then hunts for an id that was never sent. Only mint a new id for a genuinely new week.
+    tracking_id = submission.tracking_id if submission is not None else new_tracking_id(date.today())
     subject = approval_subject(plan, tracking_id)
     body = approval_body_html(plan, config.name, SCREENSHOT_CID, img_width=img_width)
 
@@ -690,6 +694,52 @@ def cmd_outlook_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    """Repair a week's ledger tracking id to the one ACTUALLY sent. A re-draft used to mint a
+    fresh random id and overwrite the ledger, orphaning the already-sent/approved email (which
+    still carries the OLD id) — so `watch` searches Outlook for an id that isn't there. This finds
+    the real message by the week's date-range in the subject (the true join key) and rewrites the
+    ledger id to match. Use --dry-run to preview without changing anything."""
+    paths = DataPaths.resolve(args.data_dir)
+    store = JsonSubmissionStore(paths.submissions_json)
+    target = _target_week(args)
+    sub = store.get_by_week(target)
+    if sub is None:
+        print(f"No submission recorded for {target}.")
+        return 0
+    ws = sub.week_start
+    week_end = ws + timedelta(days=6)
+    week_range = f"{ws.strftime('%d/%m/%Y')} - {week_end.strftime('%d/%m/%Y')}"
+    print(f"Week {ws}: ledger tracking id = {sub.tracking_id}")
+    print(f"  searching Outlook (all accounts, Sent then Inbox) for subject range "
+          f"{week_range!r} ...")
+    try:
+        drv = OutlookComEmailDriver().connect()
+        found = drv.discover_tracking_id(week_range)
+    except Exception as e:
+        print(f"  Outlook read failed: {e}", file=sys.stderr)
+        return 2
+    if found is None:
+        print("  no sent/received message found for this week's range — nothing to reconcile.")
+        print("  (is the send/approval in a folder Outlook can see? run `damia-bot outlook-check`.)")
+        return 1
+    real_id, when = found
+    when_s = when.isoformat() if when else "?"
+    if real_id == sub.tracking_id:
+        print(f"  ledger already matches the sent id ({real_id}, {when_s}). Nothing to do.")
+        return 0
+    print(f"  found real id in Outlook: {real_id}  (when={when_s})")
+    if args.dry_run:
+        print(f"  --dry-run: would rewrite ledger {sub.tracking_id} -> {real_id}.")
+        return 0
+    sub.tracking_id = real_id
+    sub.updated_at = datetime.now()
+    store.put(sub)
+    print(f"  ledger tracking id updated -> {real_id}")
+    print(f"  now run:  damia-bot watch --week {ws}")
+    return 0
+
+
 def cmd_tui(args: argparse.Namespace) -> int:
     # Import lazily so non-TUI commands don't pull in textual.
     from .tui.app import run_app
@@ -775,6 +825,15 @@ def main(argv: list[str] | None = None) -> int:
     oc.add_argument("--count", type=int, default=1,
                     help="How many recent items to show per folder (default 1).")
     oc.set_defaults(func=cmd_outlook_check)
+
+    rc = sub.add_parser("reconcile",
+                        help="Repair a week's ledger tracking id to the one actually sent (matches "
+                             "the email by its subject date-range).")
+    rc.add_argument("--week", help="Any date (YYYY-MM-DD) in the target week. "
+                                   "Default: the previous (just-worked) week.")
+    rc.add_argument("--dry-run", action="store_true",
+                    help="Find + report only; don't rewrite the ledger.")
+    rc.set_defaults(func=cmd_reconcile)
 
     rt = sub.add_parser("render-test",
                         help="Render a sample proof to check proof-rendering works on this box.")
