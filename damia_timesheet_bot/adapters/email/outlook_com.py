@@ -31,6 +31,7 @@ _OL_MAIL_ITEM = 0
 _OL_BY_VALUE = 1
 _OL_FOLDER_INBOX = 6
 _OL_FOLDER_SENT = 5
+_OL_FOLDER_DRAFTS = 16
 
 
 def _safe_name(name: str) -> str:
@@ -153,22 +154,90 @@ class OutlookComEmailDriver:
             pass
         return getattr(item, "SenderEmailAddress", "") or ""
 
-    def find_by_tracking_id(self, tracking_id: str) -> list[str]:
-        """Return EntryIDs of Inbox messages whose subject contains the tracking id."""
-        inbox = self._ns().GetDefaultFolder(_OL_FOLDER_INBOX)
-        items = inbox.Items
-        out: list[str] = []
+    def _default_folders(self, folder_type: int) -> list:
+        """Every connected account's default folder of this type (Inbox=6 / Sent=5 / Drafts=16).
+
+        The MAPI namespace's GetDefaultFolder only sees the DEFAULT store, so on a machine with
+        both a personal account and a corporate Exchange mailbox it silently ignores whichever
+        account isn't the default. That is the 'I definitely sent it, but it still says waiting
+        to send' bug: the Sent copy / approval reply live in the Exchange store we never scanned.
+        We therefore walk ALL stores. Matching is by the globally-unique tracking id, so scanning
+        extra stores can't cause a false positive."""
+        ns = self._ns()
+        folders: list = []
+        try:
+            stores = ns.Stores
+            for i in range(1, stores.Count + 1):
+                try:
+                    f = stores.Item(i).GetDefaultFolder(folder_type)
+                except Exception:
+                    continue  # store has no folder of this type (public-folder / PST / archive)
+                if f is not None:
+                    folders.append(f)
+        except Exception:
+            pass
+        if not folders:  # single-account or very old Outlook — fall back to the namespace default
+            try:
+                folders.append(ns.GetDefaultFolder(folder_type))
+            except Exception:
+                pass
+        return folders
+
+    @staticmethod
+    def _match_by_tracking_id(folder, tracking_id: str, *, cap: int = 500) -> list:
+        """Items in `folder` whose subject contains the tracking id. Tries the fast DASL
+        Restrict first, then ALWAYS falls back to a capped manual scan when Restrict returns
+        nothing — Exchange online can accept the LIKE '%…%' query yet return zero rows because
+        the leading wildcard needs a content index the mailbox may not have (whereas the
+        Gmail/IMAP dev box honours it, which is why this only bites on the work PC)."""
+        items = folder.Items
+        found: list = []
+        seen: set = set()
         try:
             dasl = f"@SQL=\"urn:schemas:httpmail:subject\" LIKE '%{tracking_id}%'"
             for it in items.Restrict(dasl):
-                out.append(it.EntryID)
+                eid = getattr(it, "EntryID", None)
+                if eid and eid not in seen:
+                    seen.add(eid)
+                    found.append(it)
         except Exception:
-            items.Sort("[ReceivedTime]", True)
+            pass  # Restrict unsupported on this store/mode — the manual scan below covers it
+        if not found:
+            for key in ("[ReceivedTime]", "[SentOn]"):
+                try:
+                    items.Sort(key, True)
+                    break
+                except Exception:
+                    continue
             for n, it in enumerate(items):
-                if n > 300:
+                if n > cap:
                     break
                 if tracking_id in (getattr(it, "Subject", "") or ""):
-                    out.append(it.EntryID)
+                    eid = getattr(it, "EntryID", None)
+                    if eid and eid not in seen:
+                        seen.add(eid)
+                        found.append(it)
+        return found
+
+    def find_by_tracking_id(self, tracking_id: str) -> list[str]:
+        """EntryIDs of Inbox messages (across ALL accounts) whose subject contains the id."""
+        out: list[str] = []
+        for folder in self._default_folders(_OL_FOLDER_INBOX):
+            for it in self._match_by_tracking_id(folder, tracking_id):
+                out.append(it.EntryID)
+        return out
+
+    def find_drafts_by_tracking_id(self, tracking_id: str) -> list[str]:
+        """EntryIDs of Drafts messages (across ALL accounts) bearing this tracking id. Lets the
+        watcher actually verify whether a draft is still sitting in Drafts, instead of merely
+        inferring it from the ledger status."""
+        out: list[str] = []
+        for folder in self._default_folders(_OL_FOLDER_DRAFTS):
+            for it in self._match_by_tracking_id(folder, tracking_id):
+                subj = (getattr(it, "Subject", "") or "").strip().lower()
+                if subj.startswith("re:"):
+                    continue  # a reply we're composing, not the original request draft
+                out.append(it.EntryID)
         return out
 
     @staticmethod
@@ -184,51 +253,32 @@ class OutlookComEmailDriver:
             return None
 
     def find_sent_original(self, tracking_id: str) -> datetime | None:
-        """If the ORIGINAL approval request bearing this tracking id is now in the Sent folder,
-        return when it was sent (naive local), else None. Replies (RE:) are excluded so only the
-        user's outgoing request counts — this is how the bot learns the draft has actually been
-        sent to the manager, without ever sending anything itself."""
-        sent = self._ns().GetDefaultFolder(_OL_FOLDER_SENT)
-        items = sent.Items
-        candidates: list = []
-        try:
-            dasl = f"@SQL=\"urn:schemas:httpmail:subject\" LIKE '%{tracking_id}%'"
-            candidates = list(items.Restrict(dasl))
-        except Exception:
-            items.Sort("[SentOn]", True)
-            for n, it in enumerate(items):
-                if n > 300:
-                    break
-                if tracking_id in (getattr(it, "Subject", "") or ""):
-                    candidates.append(it)
+        """If the ORIGINAL approval request bearing this tracking id is in ANY account's Sent
+        folder, return when it was sent (naive local), else None. Replies (RE:) are excluded so
+        only the user's outgoing request counts — this is how the bot learns the draft has
+        actually been sent, without ever sending anything itself."""
         best: datetime | None = None
-        for it in candidates:
-            subj = (getattr(it, "Subject", "") or "").strip().lower()
-            if subj.startswith("re:"):
-                continue  # a reply we sent, not the original request
-            ts = self._pytime_to_dt(getattr(it, "SentOn", None))
-            if ts and (best is None or ts > best):
-                best = ts
+        for folder in self._default_folders(_OL_FOLDER_SENT):
+            for it in self._match_by_tracking_id(folder, tracking_id):
+                subj = (getattr(it, "Subject", "") or "").strip().lower()
+                if subj.startswith("re:"):
+                    continue  # a reply we sent, not the original request
+                ts = self._pytime_to_dt(getattr(it, "SentOn", None))
+                if ts and (best is None or ts > best):
+                    best = ts
         return best
 
     def delete_drafts_by_tracking_id(self, tracking_id: str) -> int:
-        """Delete any Drafts-folder messages carrying this tracking id (used when re-drafting
-        a week). Returns how many were removed."""
-        drafts = self._ns().GetDefaultFolder(16)  # olFolderDrafts
-        items = drafts.Items
-        victims = []
-        try:
-            dasl = f"@SQL=\"urn:schemas:httpmail:subject\" LIKE '%{tracking_id}%'"
-            victims = list(items.Restrict(dasl))
-        except Exception:
-            victims = [it for it in items if tracking_id in (getattr(it, "Subject", "") or "")]
+        """Delete any Drafts-folder messages (across ALL accounts) carrying this tracking id
+        (used when re-drafting a week). Returns how many were removed."""
         n = 0
-        for it in victims:
-            try:
-                it.Delete()
-                n += 1
-            except Exception:
-                pass
+        for folder in self._default_folders(_OL_FOLDER_DRAFTS):
+            for it in self._match_by_tracking_id(folder, tracking_id):
+                try:
+                    it.Delete()
+                    n += 1
+                except Exception:
+                    pass
         return n
 
     def reply_summary(self, message_id: str) -> dict:

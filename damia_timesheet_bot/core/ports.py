@@ -81,6 +81,11 @@ class EmailDriver(Protocol):
         in the Sent folder; else None. How the bot detects the user has sent the draft."""
         ...
 
+    def find_drafts_by_tracking_id(self, tracking_id: str) -> list[str]:
+        """Return message ids of un-sent drafts for this tracking id still in Drafts. Lets the
+        watcher verify a draft physically exists rather than inferring it from ledger status."""
+        ...
+
     def extract_approval(self, message_id: str) -> ApprovalRecord | None:
         """If the message is an approval, extract the embedded image to disk and return the record."""
         ...
