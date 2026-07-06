@@ -563,29 +563,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
                   f"Skipping.")
             continue
 
-        # First, learn whether a still-drafted week has actually been sent to the manager.
-        # Finding the original request in the Sent folder flips it to AWAITING_APPROVAL, which
-        # lights up SENT_FOR_APPROVAL (then NO_RESPONSE past the threshold) on the state board.
-        if s.status is SubmissionStatus.EMAIL_DRAFTED:
-            sent_at = drv.find_sent_original(s.tracking_id)
-            if sent_at is None:
-                print("  not sent yet — draft still sitting in Outlook Drafts.")
-                continue
-            if args.dry_run:
-                print(f"  detected SENT at {sent_at} — would mark awaiting approval (dry-run).")
-                continue
-            store.mark_status(s.tracking_id, SubmissionStatus.AWAITING_APPROVAL, when=sent_at)
-            s.status = SubmissionStatus.AWAITING_APPROVAL
-            s.updated_at = sent_at
-            print(f"  detected SENT at {sent_at} -> awaiting approval.")
-
-        replies = [r for r in (drv.reply_summary(mid)
-                               for mid in drv.find_by_tracking_id(s.tracking_id))
-                   if r["is_reply"]]
-        if not replies:
-            print("  no reply yet — still awaiting approval.")
-            continue
-
+        # Probe Outlook up-front (across ALL accounts — see the adapter) so the precedence below
+        # reads off one consistent snapshot, and so we can log exactly what was found. This is
+        # also the diagnostics the work-PC Exchange case needs: is the Sent copy visible? is the
+        # draft really still in Drafts? did the approval reply land?
+        sent_at = drv.find_sent_original(s.tracking_id)
+        draft_ids = drv.find_drafts_by_tracking_id(s.tracking_id)
+        inbox_ids = drv.find_by_tracking_id(s.tracking_id)
+        replies = [r for r in (drv.reply_summary(mid) for mid in inbox_ids) if r["is_reply"]]
         approved = None
         others: list = []
         for r in replies:
@@ -594,7 +579,13 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 approved = r
             else:
                 others.append((r, verdict))
+        print(f"  scan: sent={('yes @ ' + sent_at.isoformat()) if sent_at else 'no'}  "
+              f"drafts={len(draft_ids)}  inbox={len(inbox_ids)}  "
+              f"replies={len(replies)} (approved={'yes' if approved else 'no'})")
 
+        # ---- PRECEDENCE -----------------------------------------------------------------
+        # 1) An approval in the inbox trumps everything. It can only exist if the request was
+        #    actually sent, so we don't care what the local Drafts/Sent folders say.
         if approved is not None:
             out = (paths.proofs_dir /
                    f"approval_{s.week_start.isoformat()}_{s.tracking_id.split('-')[-1]}.png")
@@ -614,7 +605,10 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 print(f"  re-rendered (status left at {s.status.value}).")
                 print(f"  -> re-attach with: damia-bot attach-proof --week {s.week_start} "
                       f"--replace")
-        else:
+            continue
+
+        # 2) A non-approval reply is a manager query/rejection — flag it for a human.
+        if others:
             r, verdict = others[-1]
             if args.dry_run:
                 verb = "would mark"
@@ -627,6 +621,30 @@ def cmd_watch(args: argparse.Namespace) -> int:
                   f"needs_attention.")
             print(f"    {verdict.reason}")
             print(f"    reply text: {verdict.cleaned[:120]!r}")
+            continue
+
+        # 3) No reply yet — but have we actually SENT it? A Sent copy in ANY account flips a
+        #    drafted week to awaiting, EVEN IF a draft is still lingering in Drafts (sending
+        #    doesn't always delete the draft, and a stale draft must not mask a real send).
+        if sent_at is not None:
+            if s.status is SubmissionStatus.EMAIL_DRAFTED and not args.dry_run:
+                store.mark_status(s.tracking_id, SubmissionStatus.AWAITING_APPROVAL, when=sent_at)
+                s.status = SubmissionStatus.AWAITING_APPROVAL
+                s.updated_at = sent_at
+                print(f"  detected SENT at {sent_at} -> awaiting approval (no reply yet).")
+            else:
+                print(f"  sent at {sent_at}; awaiting approval (no reply yet).")
+            continue
+
+        # 4) No approval, no reply, no Sent copy anywhere. Is the draft genuinely still in Drafts?
+        if draft_ids:
+            print(f"  still sitting in Drafts ({len(draft_ids)}) — not sent yet; "
+                  f"waiting for you to send.")
+        elif s.status is SubmissionStatus.EMAIL_DRAFTED:
+            print("  no Sent copy, no reply, and nothing in Drafts — the draft looks deleted "
+                  "here, or was sent/approved on another machine we can't see. Left as-is.")
+        else:
+            print("  no reply yet — still awaiting approval.")
 
     _rebuild_view(paths, config)  # refresh the state board after any updates
     return 0
