@@ -137,6 +137,72 @@ class OutlookComEmailDriver:
         return self.app.GetNamespace("MAPI")
 
     @staticmethod
+    def _item_brief(it) -> dict:
+        """A tiny read-only summary of a MailItem for the smoke test / diagnostics."""
+        def g(attr):
+            try:
+                return getattr(it, attr, None)
+            except Exception:
+                return None
+        return {
+            "subject": (g("Subject") or "")[:80],
+            "to": (g("To") or "")[:60],
+            "sender": (g("SenderName") or ""),
+            "sent": str(g("SentOn") or ""),
+            "received": str(g("ReceivedTime") or ""),
+            "unread": g("UnRead"),
+        }
+
+    def folder_overview(self, *, per_folder: int = 1) -> list[dict]:
+        """Read-only smoke test. For every connected store, report its Inbox / Sent / Drafts:
+        the folder path, the item count, and the most-recent item(s). Proves the bot can open
+        and READ those folders on this machine — without touching the timesheet flow. Never
+        writes. Returns one dict per (store, folder)."""
+        ns = self._ns()
+        report: list[dict] = []
+        specs = (("Inbox", _OL_FOLDER_INBOX, "[ReceivedTime]"),
+                 ("Sent", _OL_FOLDER_SENT, "[SentOn]"),
+                 ("Drafts", _OL_FOLDER_DRAFTS, "[CreationTime]"))
+        try:
+            stores = ns.Stores
+            store_count = stores.Count
+        except Exception as e:
+            return [{"error": f"cannot enumerate stores: {e}"}]
+        for i in range(1, store_count + 1):
+            try:
+                store = stores.Item(i)
+                store_name = getattr(store, "DisplayName", None) or f"store#{i}"
+            except Exception as e:
+                report.append({"store": f"store#{i}", "error": f"open failed: {e}"})
+                continue
+            for label, ftype, sortkey in specs:
+                entry: dict = {"store": store_name, "folder": label}
+                try:
+                    folder = store.GetDefaultFolder(ftype)
+                except Exception as e:
+                    entry["error"] = f"no default {label} ({e})"
+                    report.append(entry)
+                    continue
+                try:
+                    entry["path"] = getattr(folder, "FolderPath", "") or ""
+                    items = folder.Items
+                    entry["count"] = items.Count
+                    try:
+                        items.Sort(sortkey, True)
+                    except Exception:
+                        pass  # some folders reject the sort key; unsorted recent is fine
+                    recent: list[dict] = []
+                    for n, it in enumerate(items):
+                        if n >= per_folder:
+                            break
+                        recent.append(self._item_brief(it))
+                    entry["recent"] = recent
+                except Exception as e:
+                    entry["error"] = f"read failed ({e})"
+                report.append(entry)
+        return report
+
+    @staticmethod
     def _smtp_of(item) -> str:
         """Best-effort real SMTP. Exchange senders come back as X.500, so try the Exchange-user
         lookup then the SMTP property tag before falling back to SenderEmailAddress."""
@@ -155,32 +221,49 @@ class OutlookComEmailDriver:
         return getattr(item, "SenderEmailAddress", "") or ""
 
     def _default_folders(self, folder_type: int) -> list:
-        """Every connected account's default folder of this type (Inbox=6 / Sent=5 / Drafts=16).
+        """Default folder of this type (Inbox=6 / Sent=5 / Drafts=16) for every connected
+        account, most-authoritative first.
 
-        The MAPI namespace's GetDefaultFolder only sees the DEFAULT store, so on a machine with
-        both a personal account and a corporate Exchange mailbox it silently ignores whichever
-        account isn't the default. That is the 'I definitely sent it, but it still says waiting
-        to send' bug: the Sent copy / approval reply live in the Exchange store we never scanned.
-        We therefore walk ALL stores. Matching is by the globally-unique tracking id, so scanning
-        extra stores can't cause a false positive."""
+        The namespace's GetDefaultFolder(type) returns the PRIMARY account's folder and is
+        rock-solid — it's what worked before multi-store support. We ALWAYS include it first, so
+        a single-account (e.g. one corporate Exchange mailbox) machine behaves exactly as it did
+        before. We then ADD each other store's default folder for multi-account machines (the
+        personal-+-Exchange work-PC case). Never a replacement — a superset — because per-store
+        GetDefaultFolder can resolve to a secondary/archive/public-folder store whose 'Inbox'
+        isn't your real one. Deduped by EntryID; matching is by the globally-unique tracking id,
+        so scanning extra stores can't cause a false positive."""
         ns = self._ns()
         folders: list = []
+        seen: set = set()
+
+        def _add(f) -> None:
+            if f is None:
+                return
+            try:
+                fid = f.EntryID
+            except Exception:
+                fid = None
+            if fid is not None:
+                if fid in seen:
+                    return
+                seen.add(fid)
+            folders.append(f)
+
+        # 1) Primary account — the proven path; must always be scanned.
+        try:
+            _add(ns.GetDefaultFolder(folder_type))
+        except Exception:
+            pass
+        # 2) Any other connected stores (secondary accounts, shared mailboxes with a default).
         try:
             stores = ns.Stores
             for i in range(1, stores.Count + 1):
                 try:
-                    f = stores.Item(i).GetDefaultFolder(folder_type)
+                    _add(stores.Item(i).GetDefaultFolder(folder_type))
                 except Exception:
                     continue  # store has no folder of this type (public-folder / PST / archive)
-                if f is not None:
-                    folders.append(f)
         except Exception:
             pass
-        if not folders:  # single-account or very old Outlook — fall back to the namespace default
-            try:
-                folders.append(ns.GetDefaultFolder(folder_type))
-            except Exception:
-                pass
         return folders
 
     @staticmethod
@@ -263,7 +346,12 @@ class OutlookComEmailDriver:
                 subj = (getattr(it, "Subject", "") or "").strip().lower()
                 if subj.startswith("re:"):
                     continue  # a reply we sent, not the original request
-                ts = self._pytime_to_dt(getattr(it, "SentOn", None))
+                # A matching non-reply original in Sent IS proof of sending; don't let a quirky
+                # SentOn (some Exchange sent items report it oddly) discard that — fall back to
+                # CreationTime / ReceivedTime so we still return a timestamp.
+                ts = (self._pytime_to_dt(getattr(it, "SentOn", None))
+                      or self._pytime_to_dt(getattr(it, "CreationTime", None))
+                      or self._pytime_to_dt(getattr(it, "ReceivedTime", None)))
                 if ts and (best is None or ts > best):
                     best = ts
         return best

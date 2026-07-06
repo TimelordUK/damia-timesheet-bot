@@ -650,6 +650,46 @@ def cmd_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_outlook_check(args: argparse.Namespace) -> int:
+    """Read-only Outlook smoke test. Connect, then for every connected account show the most
+    recent item(s) in Inbox / Sent / Drafts. Proves the bot can open and read those folders on
+    this machine — no timesheet, no writes. Run this on the work PC to confirm Exchange access."""
+    try:
+        drv = OutlookComEmailDriver().connect()
+        report = drv.folder_overview(per_folder=args.count)
+    except Exception as e:
+        print(f"Could not connect to / read classic Outlook: {e}", file=sys.stderr)
+        print("Is classic Outlook (not 'new Outlook') running and signed in?", file=sys.stderr)
+        return 2
+
+    print("Connected to classic Outlook (COM).")
+    if report and report[0].get("error") and "store" not in report[0]:
+        print(f"  {report[0]['error']}", file=sys.stderr)
+        return 2
+
+    current_store = None
+    for e in report:
+        store = e.get("store", "?")
+        if store != current_store:
+            print(f"\n=== account: {store} ===")
+            current_store = store
+        folder = e.get("folder", "?")
+        if e.get("error"):
+            print(f"  {folder:<7} ! {e['error']}")
+            continue
+        print(f"  {folder:<7} {e.get('count', '?')} items   ({e.get('path', '')})")
+        for m in e.get("recent", []):
+            who = m["sender"] or m["to"] or ""
+            when = m["sent"] or m["received"] or ""
+            unread = " [unread]" if m.get("unread") else ""
+            subj = m["subject"] or "(no subject)"
+            print(f"      • {subj}")
+            print(f"        {who}  {when}{unread}")
+        if not e.get("recent"):
+            print("      (empty)")
+    return 0
+
+
 def cmd_tui(args: argparse.Namespace) -> int:
     # Import lazily so non-TUI commands don't pull in textual.
     from .tui.app import run_app
@@ -729,6 +769,12 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--dry-run", action="store_true",
                    help="Classify + report only; render no proof, change no state.")
     w.set_defaults(func=cmd_watch)
+
+    oc = sub.add_parser("outlook-check",
+                        help="Read-only smoke test: show recent Inbox/Sent/Drafts items per account.")
+    oc.add_argument("--count", type=int, default=1,
+                    help="How many recent items to show per folder (default 1).")
+    oc.set_defaults(func=cmd_outlook_check)
 
     rt = sub.add_parser("render-test",
                         help="Render a sample proof to check proof-rendering works on this box.")
