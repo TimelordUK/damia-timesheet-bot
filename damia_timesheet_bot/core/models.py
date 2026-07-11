@@ -106,6 +106,9 @@ class Submission:
     updated_at: datetime
     approver_emails: list[str] = field(default_factory=list)
     timesheet_screenshot_path: Path | None = None
+    # The manager's reply text when it was NOT a clean approval (a query/rejection). Persisted so
+    # the bot/TUI can surface "are you sure it's 5 days?" on a MGR_QUERY week. Cleaned, quote-stripped.
+    last_reply_text: str | None = None
 
 
 @dataclass

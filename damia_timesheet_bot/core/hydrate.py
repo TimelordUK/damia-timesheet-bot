@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from .bot import derive_nudge, next_signal_from, pending_human
 from .config import Config
 from .models import WeekRecord
 from .paths import DataPaths
@@ -135,6 +136,7 @@ def build_view(
     submissions: dict | None = None,
     billable_by_week: dict | None = None,
     now: datetime | None = None,
+    bot: dict | None = None,
 ) -> dict:
     rate = config.day_rate
     submissions = submissions or {}
@@ -163,6 +165,13 @@ def build_view(
             billable_days=billable_by_week.get(r.week_start),
         )
         events = derive_events(r, sub)
+        # Bot enrichment: the open human gate, its standing nudge, who moves the week next, the
+        # manager's query text (only meaningful on MGR_QUERY), and the most recent thing to happen.
+        since = sub.updated_at if sub else None
+        nudge = derive_nudge(state, since, now)
+        query_text = (sub.last_reply_text if sub and state is WeekState.MGR_QUERY else None)
+        last_action = ({"when": events[-1].when.isoformat(timespec="minutes") if events[-1].when
+                        else None, "text": events[-1].text} if events else None)
         weeks.append({
             "week_start": r.week_start.isoformat(),
             "week_end": r.week_end.isoformat(),
@@ -178,6 +187,11 @@ def build_view(
             "tracking_id": sub.tracking_id if sub else None,
             "events": [{"when": e.when.isoformat(timespec="minutes") if e.when else None,
                         "text": e.text} for e in events],
+            "pending_human": pending_human(state),
+            "nudge": nudge.to_dict() if nudge else None,
+            "query_text": query_text,
+            "last_action": last_action,
+            "next_signal_from": next_signal_from(state),
         })
 
     # 'focus' = the most recent week still needing a human (else the latest week) — the "Now" tab.
@@ -190,7 +204,7 @@ def build_view(
         focus = weeks[-1]
 
     generated = records[0].hydrated_at if records and records[0].hydrated_at else datetime.now()
-    return {
+    view = {
         "generated_at": generated.isoformat(timespec="seconds"),
         "data_root": str(paths.root),
         "contractor": {"name": config.name, "day_rate": rate, "currency": config.currency},
@@ -211,6 +225,11 @@ def build_view(
         "focus": focus["week_start"] if focus else None,
         "actions": _derive_actions(records),
     }
+    # The bot runtime block (last tick, health, messages) is produced by the poll loop and passed
+    # in; when build_view runs outside the loop (status/hydrate/tui) it's simply absent.
+    if bot is not None:
+        view["bot"] = bot
+    return view
 
 
 def write_view(view: dict, path: Path) -> None:

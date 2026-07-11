@@ -49,6 +49,18 @@ class DataPaths:
         return self.root / "submissions.json"
 
     @property
+    def bot_runtime_json(self) -> Path:
+        """The poll loop's own cross-tick memory (notification de-dup + event-cadence timers).
+        Rebuildable — worst case one repeat toast — so semi-precious, kept beside submissions."""
+        return self.root / "bot_runtime.json"
+
+    @property
+    def pause_flag(self) -> Path:
+        """Presence pauses the poll loop. The TUI toggles it; the loop only READS it, so there's
+        no write race on the runtime file."""
+        return self.root / "bot.paused"
+
+    @property
     def proofs_dir(self) -> Path:
         """Evidence artifacts (request screenshots, approval-proof PNGs). PRECIOUS — the agency
         only pays against the approval proof — so outside the disposable cache/."""
