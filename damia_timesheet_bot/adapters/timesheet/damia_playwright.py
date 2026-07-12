@@ -140,6 +140,13 @@ class DamiaTimesheetDriver:
         return self
 
     def detach(self) -> None:
+        ctx = getattr(self, "_insecure_req", None)
+        if ctx is not None:
+            try:
+                ctx.dispose()
+            except Exception:
+                pass
+            self._insecure_req = None
         if self._pw is not None:
             try:
                 self._pw.stop()
@@ -628,6 +635,77 @@ class DamiaTimesheetDriver:
             tid,
         )
 
+    def attachment_debug(self) -> dict:
+        """Read-only dump of the CURRENT week's Attachments panel DOM — the diagnostic for
+        'the folder is created but empty'. Returns the timesheet id, the wrapper's innerHTML
+        (truncated), and every img/a/button with its attributes, so we can SEE how the portal
+        actually renders attachments (e.g. GUID list items vs inline signed-URL <img>)."""
+        self.open_attachments_tab()
+        tid = self.timesheet_id
+        return self.page.evaluate(
+            """(tid) => {
+              const dump = el => ({
+                tag: el.tagName,
+                text: (el.innerText || '').trim().slice(0, 80),
+                attrs: [...el.attributes].map(a => a.name + '=' + (a.value || '').slice(0, 160)),
+              });
+              const w = document.querySelector(`#tsAttachmentWrapper_${tid}`);
+              if (!w) return {found: false, tid,
+                wrappers: [...document.querySelectorAll('[id^="tsAttachmentWrapper_"]')].map(e => e.id)};
+              return {
+                found: true, tid,
+                html: (w.innerHTML || '').slice(0, 6000),
+                imgs: [...w.querySelectorAll('img')].map(dump),
+                links: [...w.querySelectorAll('a')].map(dump),
+                buttons: [...w.querySelectorAll('button')].map(b => (b.innerText || '').trim().slice(0, 40)),
+              };
+            }""",
+            tid,
+        )
+
+    def _insecure_request(self):
+        """A lazily-created, cert-ignoring APIRequestContext for corporate TLS-intercepting
+        proxies. Chrome trusts the corp root CA (Windows store) so attachment <img>s render, but
+        Playwright's fetch is a separate Node client that rejects the self-signed chain — this
+        context skips that check. Safe here: the attachment URL carries a signed ?key= JWT that
+        self-authenticates, and it's the user's own corporate MITM they already trust."""
+        ctx = getattr(self, "_insecure_req", None)
+        if ctx is None:
+            ctx = self._pw.request.new_context(ignore_https_errors=True)
+            self._insecure_req = ctx
+        return ctx
+
+    def _fetch_bytes(self, url: str):
+        """Return (body, meta) for a URL. Tries the browser-context request first (carries
+        cookies; works with no MITM), then falls back to the cert-ignoring context when the
+        corporate proxy's self-signed chain makes the default fetch fail."""
+        try:
+            resp = self.page.request.get(url, timeout=30000)
+            body = resp.body()
+            return body, {"via": "context", "status": resp.status, "ok": resp.ok,
+                          "content_type": resp.headers.get("content-type")}
+        except Exception as e1:
+            first = f"{type(e1).__name__}: {e1}"
+        try:
+            resp = self._insecure_request().get(url, timeout=30000)
+            body = resp.body()
+            return body, {"via": "insecure", "status": resp.status, "ok": resp.ok,
+                          "content_type": resp.headers.get("content-type")}
+        except Exception as e2:
+            return b"", {"via": "failed", "ok": False, "status": None,
+                         "error": f"context[{first}] insecure[{type(e2).__name__}: {e2}]"}
+
+    def probe_fetch(self, url: str) -> dict:
+        """Fetch a URL (with the MITM fallback) and report what came back — WITHOUT saving. Used
+        by attach-debug to tell '404/expired key / HTML login' from 'bytes fine, mis-saved'."""
+        body, meta = self._fetch_bytes(url)
+        out = dict(meta)
+        out["bytes"] = len(body)
+        if body:
+            out["sniff"] = self._sniff_ext(body)
+            out["head_text"] = body[:80].decode("latin-1", "replace")
+        return out
+
     @staticmethod
     def _sniff_ext(body: bytes) -> str:
         """Pick a file extension from the actual bytes — Damia serves JPEGs from URLs ending
@@ -642,19 +720,21 @@ class DamiaTimesheetDriver:
             return ".gif"
         return ".bin"
 
-    def pull_attachments(self, save_dir) -> list:
+    def pull_attachments(self, save_dir, log=lambda *_: None) -> list:
         """Download every file attached to the CURRENT week into save_dir, fetching through
         the browser context (so the signed URL's session/cookies apply). Returns the saved
         Paths. Safe on weeks with no attachments (returns []). Switches to the Attachments
         tab as a side effect — fine for hydration since we read the week before calling this.
 
         Clears any existing attachment_* files in save_dir first so re-hydration is a clean
-        rebuild, not an accumulation."""
+        rebuild, not an accumulation. `log` receives a per-URL outcome line so a silent failure
+        (folder created, no files) is never invisible again — pass hydrate's logger to surface it."""
         from pathlib import Path
         save_dir = Path(save_dir)
         self.open_attachments_tab()
         urls = self.attachment_urls()
         if not urls:
+            log(f"   [attach] no signed-URL <img> in the panel — nothing to download.")
             return []
         save_dir.mkdir(parents=True, exist_ok=True)
         for stale in save_dir.glob("attachment_*"):
@@ -664,16 +744,16 @@ class DamiaTimesheetDriver:
                 pass
         saved: list = []
         for i, url in enumerate(urls):
-            try:
-                resp = self.page.request.get(url, timeout=30000)
-                if not resp.ok:
-                    continue
-                body = resp.body()
-                p = save_dir / f"attachment_{i + 1}{self._sniff_ext(body)}"
-                p.write_bytes(body)
-                saved.append(p)
-            except Exception:
+            body, meta = self._fetch_bytes(url)
+            if not meta.get("ok") or not body:
+                log(f"   [attach] {i + 1}: fetch failed (via={meta.get('via')} "
+                    f"status={meta.get('status')} {meta.get('error', '')}) — NOT saved. url={url[:80]}")
                 continue
+            p = save_dir / f"attachment_{i + 1}{self._sniff_ext(body)}"
+            p.write_bytes(body)
+            saved.append(p)
+            log(f"   [attach] {i + 1}: saved {p.name} ({len(body)}b via {meta['via']}, "
+                f"ct={meta.get('content_type', '?')})")
         return saved
 
     def _count_attachment_imgs(self) -> int:
