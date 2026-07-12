@@ -9,22 +9,30 @@
 // tab-bar (size=1) and status-bar (size=1) plugin panes itself — without them the tab
 // renders bare and you lose the navigation chrome.
 //
-// Main (tiled) pane = the Textual TUI, runs immediately, reads
-//   %LOCALAPPDATA%\damia-timesheet-bot\cache\view.json
-// Floating panes are start_suspended (press Enter in a pane to fire it); hidden by default
-// like your other tabs — toggle with your floating-panes keybind:
-//   * chrome-cdp : Chrome with the CDP debug port + dedicated profile + Damia (the 136+ quirk)
-//   * hydrator   : `damia-bot hydrate` — walk the portal, rebuild cache + view.json, then
-//                  press `r` in the TUI to reload
-//   * email-agent: placeholder shell for the future Outlook approval probe (draft-only)
+// Main area = the dashboard (TUI, top) + the bot agent (poll loop, bottom strip), side by side:
+//   * timesheet : the Textual TUI — the live state board. Runs immediately, reads
+//                 %LOCALAPPDATA%\damia-timesheet-bot\cache\view.json (auto-refreshes every 3s).
+//   * bot-agent : `damia-bot poll` — the autonomous workflow loop. start_suspended, so press
+//                 ENTER in the pane to START it AFTER the debug Chrome is up and you're logged
+//                 into Damia. It NEVER sends and NEVER submits — it drafts + attaches only.
+// Floating panes (start_suspended, hidden by default — toggle with your floating-panes keybind):
+//   * chrome-cdp : Chrome with the CDP debug port + dedicated profile + Damia (the 136+ quirk).
+//                  START THIS FIRST and log into Damia, THEN start the bot-agent pane.
+//   * hydrator   : `damia-bot hydrate` — force a full portal re-walk on demand.
 layout {
     cwd "C:\\Users\\sjame\\dev\\damia-timesheet-bot"
     tab name="damia" focus=true hide_floating_panes=true {
         pane size=1 borderless=true {
             plugin location="zellij:tab-bar"
         }
-        pane name="timesheet" command="uv" {
-            args "run" "damia-bot" "tui"
+        pane split_direction="horizontal" {
+            pane name="timesheet" command="uv" {
+                args "run" "damia-bot" "tui"
+            }
+            pane name="bot-agent" size="32%" command="uv" {
+                start_suspended true
+                args "run" "damia-bot" "poll" "--interval" "120"
+            }
         }
         pane size=1 borderless=true {
             plugin location="zellij:status-bar"
@@ -45,13 +53,6 @@ layout {
                 x 42
                 y 2
                 args "run" "damia-bot" "hydrate"
-            }
-            pane name="email-agent" command="C:\\Program Files\\PowerShell\\7\\pwsh.EXE" {
-                start_suspended true
-                height 10
-                width 84
-                x 42
-                y 50
             }
         }
     }
