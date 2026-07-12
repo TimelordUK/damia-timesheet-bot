@@ -140,6 +140,13 @@ class DamiaTimesheetDriver:
         return self
 
     def detach(self) -> None:
+        ctx = getattr(self, "_insecure_req", None)
+        if ctx is not None:
+            try:
+                ctx.dispose()
+            except Exception:
+                pass
+            self._insecure_req = None
         if self._pw is not None:
             try:
                 self._pw.stop()
@@ -656,22 +663,48 @@ class DamiaTimesheetDriver:
             tid,
         )
 
-    def probe_fetch(self, url: str) -> dict:
-        """Fetch a URL through the browser context and report what came back (status, content-
-        type, byte count, sniffed type, first bytes) — WITHOUT saving. Used by attach-debug to
-        tell 'the URL 404s / returns HTML' from 'the bytes are fine but we mis-saved them'."""
+    def _insecure_request(self):
+        """A lazily-created, cert-ignoring APIRequestContext for corporate TLS-intercepting
+        proxies. Chrome trusts the corp root CA (Windows store) so attachment <img>s render, but
+        Playwright's fetch is a separate Node client that rejects the self-signed chain — this
+        context skips that check. Safe here: the attachment URL carries a signed ?key= JWT that
+        self-authenticates, and it's the user's own corporate MITM they already trust."""
+        ctx = getattr(self, "_insecure_req", None)
+        if ctx is None:
+            ctx = self._pw.request.new_context(ignore_https_errors=True)
+            self._insecure_req = ctx
+        return ctx
+
+    def _fetch_bytes(self, url: str):
+        """Return (body, meta) for a URL. Tries the browser-context request first (carries
+        cookies; works with no MITM), then falls back to the cert-ignoring context when the
+        corporate proxy's self-signed chain makes the default fetch fail."""
         try:
             resp = self.page.request.get(url, timeout=30000)
             body = resp.body()
-            return {
-                "status": resp.status, "ok": resp.ok,
-                "content_type": resp.headers.get("content-type"),
-                "bytes": len(body), "sniff": self._sniff_ext(body),
-                "head_hex": body[:16].hex(),
-                "head_text": body[:80].decode("latin-1", "replace"),
-            }
-        except Exception as e:
-            return {"error": f"{type(e).__name__}: {e}"}
+            return body, {"via": "context", "status": resp.status, "ok": resp.ok,
+                          "content_type": resp.headers.get("content-type")}
+        except Exception as e1:
+            first = f"{type(e1).__name__}: {e1}"
+        try:
+            resp = self._insecure_request().get(url, timeout=30000)
+            body = resp.body()
+            return body, {"via": "insecure", "status": resp.status, "ok": resp.ok,
+                          "content_type": resp.headers.get("content-type")}
+        except Exception as e2:
+            return b"", {"via": "failed", "ok": False, "status": None,
+                         "error": f"context[{first}] insecure[{type(e2).__name__}: {e2}]"}
+
+    def probe_fetch(self, url: str) -> dict:
+        """Fetch a URL (with the MITM fallback) and report what came back — WITHOUT saving. Used
+        by attach-debug to tell '404/expired key / HTML login' from 'bytes fine, mis-saved'."""
+        body, meta = self._fetch_bytes(url)
+        out = dict(meta)
+        out["bytes"] = len(body)
+        if body:
+            out["sniff"] = self._sniff_ext(body)
+            out["head_text"] = body[:80].decode("latin-1", "replace")
+        return out
 
     @staticmethod
     def _sniff_ext(body: bytes) -> str:
@@ -711,21 +744,16 @@ class DamiaTimesheetDriver:
                 pass
         saved: list = []
         for i, url in enumerate(urls):
-            try:
-                resp = self.page.request.get(url, timeout=30000)
-                body = resp.body() if resp is not None else b""
-                if not resp.ok:
-                    log(f"   [attach] {i + 1}: HTTP {resp.status} ({len(body)}b) — NOT saved. "
-                        f"url={url[:90]}")
-                    continue
-                p = save_dir / f"attachment_{i + 1}{self._sniff_ext(body)}"
-                p.write_bytes(body)
-                saved.append(p)
-                log(f"   [attach] {i + 1}: saved {p.name} ({len(body)}b, "
-                    f"ct={resp.headers.get('content-type', '?')})")
-            except Exception as e:
-                log(f"   [attach] {i + 1}: ERROR {type(e).__name__}: {e}  url={url[:90]}")
+            body, meta = self._fetch_bytes(url)
+            if not meta.get("ok") or not body:
+                log(f"   [attach] {i + 1}: fetch failed (via={meta.get('via')} "
+                    f"status={meta.get('status')} {meta.get('error', '')}) — NOT saved. url={url[:80]}")
                 continue
+            p = save_dir / f"attachment_{i + 1}{self._sniff_ext(body)}"
+            p.write_bytes(body)
+            saved.append(p)
+            log(f"   [attach] {i + 1}: saved {p.name} ({len(body)}b via {meta['via']}, "
+                f"ct={meta.get('content_type', '?')})")
         return saved
 
     def _count_attachment_imgs(self) -> int:
