@@ -57,7 +57,7 @@ def hydrate(
                     log(f"   [warn] PDF download failed for {start}: {e}")
             if pull_attachments:
                 try:
-                    atts = driver.pull_attachments(paths.attachments_for(start))
+                    atts = driver.pull_attachments(paths.attachments_for(start), log=log)
                 except Exception as e:
                     log(f"   [warn] attachment pull failed for {start}: {e}")
 

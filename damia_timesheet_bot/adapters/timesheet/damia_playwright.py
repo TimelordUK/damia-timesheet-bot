@@ -628,6 +628,51 @@ class DamiaTimesheetDriver:
             tid,
         )
 
+    def attachment_debug(self) -> dict:
+        """Read-only dump of the CURRENT week's Attachments panel DOM — the diagnostic for
+        'the folder is created but empty'. Returns the timesheet id, the wrapper's innerHTML
+        (truncated), and every img/a/button with its attributes, so we can SEE how the portal
+        actually renders attachments (e.g. GUID list items vs inline signed-URL <img>)."""
+        self.open_attachments_tab()
+        tid = self.timesheet_id
+        return self.page.evaluate(
+            """(tid) => {
+              const dump = el => ({
+                tag: el.tagName,
+                text: (el.innerText || '').trim().slice(0, 80),
+                attrs: [...el.attributes].map(a => a.name + '=' + (a.value || '').slice(0, 160)),
+              });
+              const w = document.querySelector(`#tsAttachmentWrapper_${tid}`);
+              if (!w) return {found: false, tid,
+                wrappers: [...document.querySelectorAll('[id^="tsAttachmentWrapper_"]')].map(e => e.id)};
+              return {
+                found: true, tid,
+                html: (w.innerHTML || '').slice(0, 6000),
+                imgs: [...w.querySelectorAll('img')].map(dump),
+                links: [...w.querySelectorAll('a')].map(dump),
+                buttons: [...w.querySelectorAll('button')].map(b => (b.innerText || '').trim().slice(0, 40)),
+              };
+            }""",
+            tid,
+        )
+
+    def probe_fetch(self, url: str) -> dict:
+        """Fetch a URL through the browser context and report what came back (status, content-
+        type, byte count, sniffed type, first bytes) — WITHOUT saving. Used by attach-debug to
+        tell 'the URL 404s / returns HTML' from 'the bytes are fine but we mis-saved them'."""
+        try:
+            resp = self.page.request.get(url, timeout=30000)
+            body = resp.body()
+            return {
+                "status": resp.status, "ok": resp.ok,
+                "content_type": resp.headers.get("content-type"),
+                "bytes": len(body), "sniff": self._sniff_ext(body),
+                "head_hex": body[:16].hex(),
+                "head_text": body[:80].decode("latin-1", "replace"),
+            }
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+
     @staticmethod
     def _sniff_ext(body: bytes) -> str:
         """Pick a file extension from the actual bytes — Damia serves JPEGs from URLs ending
@@ -642,19 +687,21 @@ class DamiaTimesheetDriver:
             return ".gif"
         return ".bin"
 
-    def pull_attachments(self, save_dir) -> list:
+    def pull_attachments(self, save_dir, log=lambda *_: None) -> list:
         """Download every file attached to the CURRENT week into save_dir, fetching through
         the browser context (so the signed URL's session/cookies apply). Returns the saved
         Paths. Safe on weeks with no attachments (returns []). Switches to the Attachments
         tab as a side effect — fine for hydration since we read the week before calling this.
 
         Clears any existing attachment_* files in save_dir first so re-hydration is a clean
-        rebuild, not an accumulation."""
+        rebuild, not an accumulation. `log` receives a per-URL outcome line so a silent failure
+        (folder created, no files) is never invisible again — pass hydrate's logger to surface it."""
         from pathlib import Path
         save_dir = Path(save_dir)
         self.open_attachments_tab()
         urls = self.attachment_urls()
         if not urls:
+            log(f"   [attach] no signed-URL <img> in the panel — nothing to download.")
             return []
         save_dir.mkdir(parents=True, exist_ok=True)
         for stale in save_dir.glob("attachment_*"):
@@ -666,13 +713,18 @@ class DamiaTimesheetDriver:
         for i, url in enumerate(urls):
             try:
                 resp = self.page.request.get(url, timeout=30000)
+                body = resp.body() if resp is not None else b""
                 if not resp.ok:
+                    log(f"   [attach] {i + 1}: HTTP {resp.status} ({len(body)}b) — NOT saved. "
+                        f"url={url[:90]}")
                     continue
-                body = resp.body()
                 p = save_dir / f"attachment_{i + 1}{self._sniff_ext(body)}"
                 p.write_bytes(body)
                 saved.append(p)
-            except Exception:
+                log(f"   [attach] {i + 1}: saved {p.name} ({len(body)}b, "
+                    f"ct={resp.headers.get('content-type', '?')})")
+            except Exception as e:
+                log(f"   [attach] {i + 1}: ERROR {type(e).__name__}: {e}  url={url[:90]}")
                 continue
         return saved
 

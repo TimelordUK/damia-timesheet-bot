@@ -512,6 +512,57 @@ def cmd_render_test(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_attach_debug(args: argparse.Namespace) -> int:
+    """Read-only diagnosis of the 'attachment folder created but empty' bug. Navigates to a week,
+    dumps its Attachments panel DOM (imgs/links/buttons + innerHTML), shows what attachment_urls()
+    matches, and tries to fetch the first candidate — reporting HTTP status + bytes. Downloads
+    nothing. Use on the box where attachments come out empty (e.g. the work portal)."""
+    paths = DataPaths.resolve(args.data_dir)
+    week_start = _target_week(args)
+    with DamiaTimesheetDriver(cdp_url=args.cdp_url).attached() as drv:
+        drv.navigate_to_week(week_start)
+        landed = drv.current_week_range()[0]
+        print(f"Week {week_start} (landed on {landed}), timesheet_id={drv.timesheet_id}")
+        info = drv.attachment_debug()
+        if not info.get("found"):
+            print(f"  NO wrapper #tsAttachmentWrapper_{info.get('tid')} on the page.")
+            print(f"  wrappers present: {info.get('wrappers')}")
+            return 1
+        print(f"  buttons: {info['buttons']}")
+        print(f"  <img> ({len(info['imgs'])}):")
+        for im in info["imgs"]:
+            print(f"      {im['attrs']}")
+        print(f"  <a> ({len(info['links'])}):")
+        for ln in info["links"]:
+            print(f"      text={ln['text']!r}  {ln['attrs']}")
+
+        urls = drv.attachment_urls()
+        print(f"  attachment_urls() matched {len(urls)}:")
+        for u in urls[:5]:
+            print(f"      {u[:120]}")
+
+        # Pick something to test-fetch: a matched signed URL, else any http(s) src/href we saw.
+        target = urls[0] if urls else None
+        if target is None:
+            for el in info["imgs"] + info["links"]:
+                for a in el["attrs"]:
+                    val = a.split("=", 1)[-1]
+                    if val.startswith("http") or val.startswith("//"):
+                        target = ("https:" + val) if val.startswith("//") else val
+                        break
+                if target:
+                    break
+        if target:
+            print(f"  test-fetch: {target[:110]}")
+            print(f"      -> {drv.probe_fetch(target)}")
+        else:
+            print("  no fetchable URL found in the panel — attachments aren't inline signed URLs "
+                  "here; paste the innerHTML below so we can adapt the selector.")
+        print("\n  --- wrapper innerHTML (truncated) ---")
+        print(info["html"])
+    return 0
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Passive Outlook sweep over in-flight weeks. For a still-drafted week, detect whether it
     has been sent (original in the Sent folder) and advance it to AWAITING_APPROVAL. For a sent
@@ -860,6 +911,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="Render a sample proof to check proof-rendering works on this box.")
     rt.add_argument("--cdp-url", default=DEFAULT_CDP_URL)
     rt.set_defaults(func=cmd_render_test)
+
+    ad = sub.add_parser("attach-debug",
+                        help="Read-only: dump a week's Attachments panel DOM + test-fetch (diagnose empty folders).")
+    ad.add_argument("--week", help="Any date (YYYY-MM-DD) in the target week. Default: the previous week.")
+    ad.add_argument("--cdp-url", default=DEFAULT_CDP_URL)
+    ad.set_defaults(func=cmd_attach_debug)
 
     t = sub.add_parser("tui", help="Launch the Textual TUI (reads view.json).")
     t.set_defaults(func=cmd_tui)
