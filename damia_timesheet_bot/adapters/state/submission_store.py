@@ -27,6 +27,7 @@ def _submission_to_dict(s: Submission) -> dict:
         "timesheet_screenshot_path": (
             str(s.timesheet_screenshot_path) if s.timesheet_screenshot_path else None
         ),
+        "last_reply_text": s.last_reply_text,
     }
 
 
@@ -40,6 +41,7 @@ def _dict_to_submission(d: dict) -> Submission:
         updated_at=datetime.fromisoformat(d["updated_at"]),
         approver_emails=list(d.get("approver_emails") or []),
         timesheet_screenshot_path=Path(shot) if shot else None,
+        last_reply_text=d.get("last_reply_text"),
     )
 
 

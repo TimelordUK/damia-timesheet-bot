@@ -33,6 +33,13 @@ from .core.models import Day, Submission, SubmissionStatus, Week, WeekRecord
 from .core.paths import DataPaths
 from .core.tracking import new_tracking_id
 from .core.weekplan import approval_body_html, approval_subject, build_week_plan, sunday_of
+from .runner import (
+    locate_proof,
+    navigate_decide_fill,
+    run_attach,
+    run_draft,
+    run_watch_week,
+)
 
 
 def cmd_hydrate(args: argparse.Namespace) -> int:
@@ -224,42 +231,6 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
-def _units_match(a, b) -> bool:
-    return len(a) == len(b) and all(round(x, 2) == round(y, 2) for x, y in zip(a, b))
-
-
-def _read_live_record(drv, plan) -> WeekRecord:
-    live = drv.read_week()
-    return WeekRecord(
-        week_start=plan.week_start, week_end=plan.week_end, status=drv.status_word(),
-        total_units=live.total_units, worked_days=live.worked_days,
-        day_units=tuple(d.units for d in live.days),
-    )
-
-
-def _navigate_decide_fill(drv, plan, submission, *, do_fill: bool):
-    """Navigate to the plan's week, decide against the LIVE portal, and (if do_fill and the
-    decision is READY and the sheet isn't already correct) fill per the plan + Save draft.
-    Returns (decision, live_record_after). Mutates only on READY_TO_DRAFT."""
-    drv.navigate_to_week(plan.week_start)
-    landed = drv.current_week_range()[0]
-    if landed != plan.week_start:
-        return (Decision(DecisionKind.MANUAL_INTERVENTION, plan.week_start,
-                         f"driver landed on {landed}, not {plan.week_start}."), None)
-
-    rec = _read_live_record(drv, plan)
-    decision = decide_week(plan, rec, submission)
-
-    if do_fill and decision.kind is DecisionKind.READY_TO_DRAFT \
-            and not _units_match(rec.day_units, plan.day_units):
-        week = Week(start=plan.week_start, days=[
-            Day(date=plan.week_start + timedelta(days=i), units=plan.day_units[i])
-            for i in range(7)
-        ])
-        drv.fill_week(week)
-        drv.save_draft()
-        rec = _read_live_record(drv, plan)
-    return decision, rec
 
 
 def cmd_fill_draft(args: argparse.Namespace) -> int:
@@ -287,7 +258,7 @@ def cmd_fill_draft(args: argparse.Namespace) -> int:
         return 0
 
     with DamiaTimesheetDriver(cdp_url=args.cdp_url).attached() as drv:
-        decision, rec = _navigate_decide_fill(drv, plan, submission, do_fill=not args.dry_run)
+        decision, rec = navigate_decide_fill(drv, plan, submission, do_fill=not args.dry_run)
         if rec is not None:
             print(f"  live portal: {rec.status}  units="
                   f"{','.join(f'{u:g}' for u in rec.day_units)}")
@@ -315,92 +286,32 @@ def cmd_draft(args: argparse.Namespace) -> int:
     except ConfigError as e:
         print(f"Config error: {e}", file=sys.stderr)
         return 2
-    if config.is_placeholder:
-        print("[abort] config.yml is still the template — set your name first.", file=sys.stderr)
-        return 2
-    approvers = [a for a in config.approver_emails if a and "example.com" not in a]
-    if not approvers:
-        print("[abort] no real approver_emails in config.yml.", file=sys.stderr)
-        return 2
 
     holidays = UkGovUkHolidayProvider(cache_dir=paths.root / "holidays")
     week_start = _target_week(args)
     plan = build_week_plan(week_start, holidays, leave)
     store = JsonSubmissionStore(paths.submissions_json)
     submission = store.get_by_week(week_start)
-    # --force lets us regenerate a week already in flight: ignore its in-flight submission for
-    # the decision and delete the stale Outlook draft before re-drafting.
-    superseding = bool(args.force and submission is not None and submission.status.is_in_flight)
-    decision_sub = None if superseding else submission
 
     print(f"Week {plan.week_start} – {plan.week_end}: plan = {plan.billable_days} day(s)")
-    if plan.billable_days == 0:
-        print(">>> 0 billable days — no email to draft.")
-        return 0
 
+    # One guarded code path shared with the poll loop (runner.run_draft). Dry-run needs no Outlook.
+    email_drv = None if args.dry_run else OutlookComEmailDriver().connect()
     with DamiaTimesheetDriver(cdp_url=args.cdp_url).attached() as drv:
-        decision, rec = _navigate_decide_fill(drv, plan, decision_sub, do_fill=not args.dry_run)
-        if rec is not None:
-            print(f"  live portal: {rec.status}  units="
-                  f"{','.join(f'{u:g}' for u in rec.day_units)}")
-        print(f"  decision   : {decision.kind.value} — {decision.reason}")
-        if decision.kind is not DecisionKind.READY_TO_DRAFT:
-            print(">>> Not READY_TO_DRAFT — no email drafted, no changes made.")
-            return 0 if decision.kind is DecisionKind.NOTHING_TO_DO else 1
-
-        # Full-page capture of the portal — same context as the downloaded proofs
-        # (name, date range, Timesheet Id, status, grid).
-        png = drv.screenshot_week()
-        img_width = getattr(drv, "last_screenshot_css_width", None)
-
-    # The tracking id is a STABLE per-week thread correlator, not a per-attempt value. Reuse the
-    # week's existing id on a re-draft — minting a fresh random one each time (and overwriting the
-    # ledger) orphaned the already-sent/approved email, which still carries the old id, so `watch`
-    # then hunts for an id that was never sent. Only mint a new id for a genuinely new week.
-    tracking_id = submission.tracking_id if submission is not None else new_tracking_id(date.today())
-    subject = approval_subject(plan, tracking_id)
-    body = approval_body_html(plan, config.name, SCREENSHOT_CID, img_width=img_width)
-
-    paths.ensure_proofs()
-    shot_path = paths.proofs_dir / f"request_{week_start.isoformat()}_{tracking_id.split('-')[-1]}.png"
-    shot_path.write_bytes(png)
-
-    print(f"  tracking id: {tracking_id}")
-    print(f"  to         : {', '.join(approvers)}")
-    print(f"  subject    : {subject}")
-    print(f"  screenshot : {shot_path}  ({len(png)} bytes)")
-
-    if args.dry_run:
-        print(">>> --dry-run: would create the above as an Outlook DRAFT. Outlook untouched.")
-        return 0
-
-    email_drv = OutlookComEmailDriver().connect()
-    if superseding:
-        removed = email_drv.delete_drafts_by_tracking_id(submission.tracking_id)
-        print(f"  superseded prior draft {submission.tracking_id} (removed {removed}).")
-    entry_id = email_drv.draft_submission_email(
-        to=approvers, subject=subject, body_html=body, attachment_png=png,
-        tracking_id=tracking_id,
-    )
-    now = datetime.now()
-    store.put(Submission(
-        tracking_id=tracking_id, week_start=week_start, status=SubmissionStatus.EMAIL_DRAFTED,
-        created_at=now, updated_at=now, approver_emails=approvers,
-        timesheet_screenshot_path=shot_path,
-    ))
-    print(f">>> Created Outlook DRAFT (EntryID {entry_id[:12]}…) in your Drafts folder. "
-          f"Review and send it yourself — the bot never sends.")
-    return 0
+        result = run_draft(paths, config, drv, email_drv, plan, submission, store,
+                           force=args.force, dry_run=args.dry_run)
+    for m in result.messages:
+        print(m if m.startswith("[abort]") else f"  {m}")
+    return 0 if result.ok else 1
 
 
 def cmd_attach_proof(args: argparse.Namespace) -> int:
     """Upload the approval-proof PNG to a week's Damia Attachments panel. This attaches
     evidence only — it never clicks Submit. Defaults to the week's approval proof; --file
     overrides. Marks the submission SENT_TO_PORTAL on success."""
-    from pathlib import Path
     paths = DataPaths.resolve(args.data_dir)
     try:
-        config, _ = load_or_scaffold(paths.config_file)
+        load_or_scaffold(paths.config_file)
     except ConfigError as e:
         print(f"Config error: {e}", file=sys.stderr)
         return 2
@@ -409,81 +320,24 @@ def cmd_attach_proof(args: argparse.Namespace) -> int:
     store = JsonSubmissionStore(paths.submissions_json)
     sub = store.get_by_week(week_start)
 
-    if args.file:
-        proof = Path(args.file)
-    elif sub is not None:
-        proof = paths.proofs_dir / f"approval_{week_start.isoformat()}_{sub.tracking_id.split('-')[-1]}.png"
-    else:
+    proof = locate_proof(paths, week_start, sub, args.file)
+    if proof is None:
         print(f"[abort] no submission for {week_start} and no --file given.", file=sys.stderr)
         return 2
 
-    if not proof.exists():
-        print(f"[abort] proof not found: {proof}\n        Run `watch` to generate it, or pass "
-              f"--file.", file=sys.stderr)
-        return 2
-    _ok_states = (SubmissionStatus.APPROVED, SubmissionStatus.SENT_TO_PORTAL)
-    if sub is not None and sub.status not in _ok_states and not args.file:
-        print(f"[abort] {week_start} is {sub.status.value}, not approved — refusing to attach an "
-              f"unapproved proof. Use --file to override.", file=sys.stderr)
-        return 1
-
-    print(f"Week {week_start}: attaching {proof.name} ({proof.stat().st_size} bytes)")
+    print(f"Week {week_start}: attaching {proof.name}")
     if args.dry_run:
         print(">>> --dry-run: would upload the above to the Damia Attachments panel. No changes.")
         return 0
 
+    # Shared guarded path with the poll loop (runner.run_attach): upload + Save draft + verify-persist.
     with DamiaTimesheetDriver(cdp_url=args.cdp_url).attached() as drv:
-        drv.navigate_to_week(week_start)
-        if drv.current_week_range()[0] != week_start:
-            print(f"[abort] driver landed on {drv.current_week_range()[0]}, not {week_start}.",
-                  file=sys.stderr)
-            return 1
-        drv.open_attachments_tab()
-        existing = []
-        try:
-            existing = drv.attachment_urls()
-        except Exception:
-            pass
-        before_count = len(existing)
-
-        uploaded = False
-        if existing and not args.replace:
-            print(f"  {before_count} attachment(s) already on this week — skipping upload "
-                  f"(use --replace to add another).")
-        else:
-            if not drv.upload_attachment(proof):
-                print(">>> Upload did not confirm within the timeout — check the portal "
-                      "manually.", file=sys.stderr)
-                return 1
-            uploaded = True
-
-        saved = False
-        if not args.no_save:
-            drv.save_draft()   # bottom-left Save draft — NEVER Submit
-            saved = True
-
-        # Verify the upload actually PERSISTED. The panel can keep showing a freshly-picked
-        # file that a reload reveals was never saved server-side (the silent failure seen on
-        # the corporate portal). Reload + recount signed attachments before trusting it.
-        if uploaded and saved:
-            try:
-                after_count = drv.reload_and_count_attachments(week_start)
-            except Exception as e:
-                print(f">>> Could NOT verify the attachment after reload ({e}). Check the "
-                      f"portal — it may not have saved. Proof: {proof}", file=sys.stderr)
-                return 1
-            if after_count <= before_count:
-                print(f">>> VERIFY FAILED: after reload the week still has {after_count} "
-                      f"attachment(s) — the upload did NOT persist. Nothing marked done.\n"
-                      f"    Attach it by hand from: {proof}", file=sys.stderr)
-                return 1
-            print(f"  verified: {after_count} attachment(s) now persisted on the week.")
-
-    if sub is not None and (saved or args.no_save):
-        store.mark_status(sub.tracking_id, SubmissionStatus.SENT_TO_PORTAL)
-    tail = "and Saved the draft" if saved else "(draft NOT saved — use without --no-save)"
-    print(f">>> Proof attached {tail}. Submit was NOT clicked — do the final submit yourself.")
-    return 0
+        result = run_attach(paths, store, drv, week_start, proof, sub,
+                            replace=args.replace, save=not args.no_save,
+                            allow_unapproved=bool(args.file))
+    for m in result.messages:
+        print(m if m.startswith("[abort]") else f"  {m}")
+    return 0 if result.ok else 1
 
 
 def cmd_render_test(args: argparse.Namespace) -> int:
@@ -609,118 +463,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     drv = OutlookComEmailDriver().connect()
     for s in work:
-        print(f"\n{s.week_start}  {s.tracking_id}  ({s.status.value})")
-
-        # Once the agency already has the week (submitted/approved/rejected) there's nothing to
-        # redo — re-rendering or re-attaching is pointless, so skip it loudly.
-        if portal_status.get(s.week_start) in _AGENCY_TERMINAL:
-            print(f"  already '{portal_status[s.week_start]}' at the agency — too late to redo. "
-                  f"Skipping.")
-            continue
-
-        # Probe Outlook up-front (across ALL accounts — see the adapter) so the precedence below
-        # reads off one consistent snapshot, and so we can log exactly what was found. This is
-        # also the diagnostics the work-PC Exchange case needs: is the Sent copy visible? is the
-        # draft really still in Drafts? did the approval reply land?
-        sent_at = drv.find_sent_original(s.tracking_id)
-        draft_ids = drv.find_drafts_by_tracking_id(s.tracking_id)
-        inbox_ids = drv.find_by_tracking_id(s.tracking_id)
-
-        # Self-heal a drifted tracking id. If the ledger id matches NOTHING in Outlook, the id
-        # was likely rotated by a re-draft (each draft used to mint a fresh random id). Recover
-        # the real one by the week's date-range in the subject — the true join key — and adopt
-        # it, so the scan below runs against the id that was actually sent/approved. Only pay for
-        # the extra range scan in the failure case (everything empty).
-        if not sent_at and not inbox_ids and not draft_ids:
-            week_end = s.week_start + timedelta(days=6)
-            week_range = f"{s.week_start.strftime('%d/%m/%Y')} - {week_end.strftime('%d/%m/%Y')}"
-            found = drv.discover_tracking_id(week_range)
-            if found is not None and found[0] != s.tracking_id:
-                real_id = found[0]
-                print(f"  ledger id {s.tracking_id} not found in Outlook; discovered {real_id} "
-                      f"by week range {week_range!r} -> adopting{' (dry-run)' if args.dry_run else ''}.")
-                if not args.dry_run:
-                    s.tracking_id = real_id
-                    store.put(s)  # rewrite the ledger row (keyed by week_start) with the real id
-                sent_at = drv.find_sent_original(s.tracking_id)
-                draft_ids = drv.find_drafts_by_tracking_id(s.tracking_id)
-                inbox_ids = drv.find_by_tracking_id(s.tracking_id)
-
-        replies = [r for r in (drv.reply_summary(mid) for mid in inbox_ids) if r["is_reply"]]
-        approved = None
-        others: list = []
-        for r in replies:
-            verdict = classify_reply(extract_new_text(r["body"]), approval_cfg)
-            if verdict.is_approval:
-                approved = r
-            else:
-                others.append((r, verdict))
-        print(f"  scan: sent={('yes @ ' + sent_at.isoformat()) if sent_at else 'no'}  "
-              f"drafts={len(draft_ids)}  inbox={len(inbox_ids)}  "
-              f"replies={len(replies)} (approved={'yes' if approved else 'no'})")
-
-        # ---- PRECEDENCE -----------------------------------------------------------------
-        # 1) An approval in the inbox trumps everything. It can only exist if the request was
-        #    actually sent, so we don't care what the local Drafts/Sent folders say.
-        if approved is not None:
-            out = (paths.proofs_dir /
-                   f"approval_{s.week_start.isoformat()}_{s.tracking_id.split('-')[-1]}.png")
-            if args.dry_run:
-                print(f"  APPROVED by {approved['sender_smtp']} — would render proof to "
-                      f"{out.name} (dry-run).")
-                continue
-            paths.ensure_proofs()
-            drv.render_proof(approved["entry_id"], out, cdp_url=args.cdp_url)
-            print(f"  APPROVED by {approved['sender_smtp']} ({approved['received']}).")
-            print(f"  proof: {out}")
-            if s.status.is_in_flight:
-                store.mark_status(s.tracking_id, SubmissionStatus.APPROVED)
-                print("  -> upload this to the Damia week's Attachments tab (manual final step).")
-            else:
-                # forced re-render of a settled week — don't regress its status.
-                print(f"  re-rendered (status left at {s.status.value}).")
-                print(f"  -> re-attach with: damia-bot attach-proof --week {s.week_start} "
-                      f"--replace")
-            continue
-
-        # 2) A non-approval reply is a manager query/rejection — flag it for a human.
-        if others:
-            r, verdict = others[-1]
-            if args.dry_run:
-                verb = "would mark"
-            elif s.status.is_in_flight:
-                store.mark_status(s.tracking_id, SubmissionStatus.NEEDS_ATTENTION)
-                verb = "marked"
-            else:
-                verb = "left"  # forced re-check of a settled week — don't regress
-            print(f"  reply from {r['sender_smtp']} is NOT a clean approval — {verb} "
-                  f"needs_attention.")
-            print(f"    {verdict.reason}")
-            print(f"    reply text: {verdict.cleaned[:120]!r}")
-            continue
-
-        # 3) No reply yet — but have we actually SENT it? A Sent copy in ANY account flips a
-        #    drafted week to awaiting, EVEN IF a draft is still lingering in Drafts (sending
-        #    doesn't always delete the draft, and a stale draft must not mask a real send).
-        if sent_at is not None:
-            if s.status is SubmissionStatus.EMAIL_DRAFTED and not args.dry_run:
-                store.mark_status(s.tracking_id, SubmissionStatus.AWAITING_APPROVAL, when=sent_at)
-                s.status = SubmissionStatus.AWAITING_APPROVAL
-                s.updated_at = sent_at
-                print(f"  detected SENT at {sent_at} -> awaiting approval (no reply yet).")
-            else:
-                print(f"  sent at {sent_at}; awaiting approval (no reply yet).")
-            continue
-
-        # 4) No approval, no reply, no Sent copy anywhere. Is the draft genuinely still in Drafts?
-        if draft_ids:
-            print(f"  still sitting in Drafts ({len(draft_ids)}) — not sent yet; "
-                  f"waiting for you to send.")
-        elif s.status is SubmissionStatus.EMAIL_DRAFTED:
-            print("  no Sent copy, no reply, and nothing in Drafts — the draft looks deleted "
-                  "here, or was sent/approved on another machine we can't see. Left as-is.")
-        else:
-            print("  no reply yet — still awaiting approval.")
+        print()
+        # One guarded per-week path shared with the poll loop (runner.run_watch_week): detect
+        # send / approval / query, self-heal a drifted tracking id, render proof, advance ledger.
+        result = run_watch_week(paths=paths, store=store, drv=drv, s=s, approval_cfg=approval_cfg,
+                                portal_status=portal_status, cdp_url=args.cdp_url,
+                                dry_run=args.dry_run, render=True)
+        for m in result.messages:
+            print(f"  {m}")
 
     _rebuild_view(paths, config)  # refresh the state board after any updates
     return 0
@@ -817,6 +567,27 @@ def cmd_tui(args: argparse.Namespace) -> int:
     from .tui.app import run_app
     run_app(args.data_dir)
     return 0
+
+
+def cmd_poll(args: argparse.Namespace) -> int:
+    """The autonomous workflow loop. Each tick: sense Outlook + (event-driven) the portal, let the
+    circuit-breaker pick ≤1 mechanical action per week (fill+draft / attach proof), fire
+    transition + standing-gate toasts, and write cache/view.json for the TUI. NEVER sends, NEVER
+    submits — the two human gates stay manual. Resumable: state is re-derived from ground truth
+    each tick, so it picks up wherever things stand."""
+    from .poll import poll_loop
+    paths = DataPaths.resolve(args.data_dir)
+    try:
+        config, _ = load_or_scaffold(paths.config_file)
+    except ConfigError as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        return 2
+    if config.is_placeholder:
+        print("[abort] config.yml is still the template — run `init`, set your name + approvers "
+              "first.", file=sys.stderr)
+        return 2
+    return poll_loop(paths, config, cdp_url=args.cdp_url, interval=args.interval,
+                     notify_enabled=not args.no_notify, once=args.once, log=print)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -920,6 +691,16 @@ def main(argv: list[str] | None = None) -> int:
 
     t = sub.add_parser("tui", help="Launch the Textual TUI (reads view.json).")
     t.set_defaults(func=cmd_tui)
+
+    po = sub.add_parser("poll",
+                        help="Autonomous workflow loop: sense→draft/attach→notify. Never sends/submits.")
+    po.add_argument("--cdp-url", default=DEFAULT_CDP_URL)
+    po.add_argument("--interval", type=float, default=180.0,
+                    help="Seconds between ticks (default 180).")
+    po.add_argument("--once", action="store_true", help="Run a single tick and exit.")
+    po.add_argument("--no-notify", action="store_true",
+                    help="Suppress desktop toasts (state still lands in the JSON/TUI).")
+    po.set_defaults(func=cmd_poll)
 
     args = p.parse_args(argv)
     return args.func(args)
