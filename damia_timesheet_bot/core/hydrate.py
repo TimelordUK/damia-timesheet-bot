@@ -149,6 +149,7 @@ def build_view(
     billable_by_week: dict | None = None,
     now: datetime | None = None,
     bot: dict | None = None,
+    today: date | None = None,
 ) -> dict:
     rate = config.day_rate
     submissions = submissions or {}
@@ -206,14 +207,19 @@ def build_view(
             "next_signal_from": next_signal_from(state),
         })
 
-    # 'focus' = the most recent week still needing a human (else the latest week) — the "Now" tab.
+    # 'focus' = the most recent week still needing a human — the "Now" tab. Restricted to weeks
+    # at or before the target (last COMPLETED week): the in-progress week is always empty and so
+    # always NEEDS_FILLING, which otherwise wins `reversed()` every time and pins the Now tab to
+    # a week whose days have not happened yet. Same rule as _derive_actions.
+    target_week = sunday_of(today or date.today()) - timedelta(days=7)
+    settled = [w for w in weeks if date.fromisoformat(w["week_start"]) <= target_week]
     focus = None
-    for w in reversed(weeks):
+    for w in reversed(settled):
         if WeekState(w["state"]).needs_human:
             focus = w
             break
-    if focus is None and weeks:
-        focus = weeks[-1]
+    if focus is None and settled:
+        focus = settled[-1]
 
     generated = records[0].hydrated_at if records and records[0].hydrated_at else datetime.now()
     view = {
@@ -235,7 +241,7 @@ def build_view(
         },
         "weeks": weeks,
         "focus": focus["week_start"] if focus else None,
-        "actions": _derive_actions(records),
+        "actions": _derive_actions(records, today=today),
     }
     # The bot runtime block (last tick, health, messages) is produced by the poll loop and passed
     # in; when build_view runs outside the loop (status/hydrate/tui) it's simply absent.

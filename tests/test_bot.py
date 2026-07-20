@@ -16,7 +16,11 @@ from damia_timesheet_bot.core.bot import (
     pending_human,
     plan_tick,
 )
-from damia_timesheet_bot.core.hydrate import _derive_actions
+from pathlib import Path
+
+from damia_timesheet_bot.core.config import Config
+from damia_timesheet_bot.core.hydrate import _derive_actions, build_view
+from damia_timesheet_bot.core.paths import DataPaths
 from damia_timesheet_bot.core.models import WeekRecord
 from damia_timesheet_bot.core.state import WeekState
 
@@ -195,3 +199,28 @@ def test_older_unsubmitted_filled_weeks_still_flagged():
     kinds = {a["kind"]: a["week"] for a in actions}
     assert kinds["unsubmitted_filled_week"] == "2026-07-05"
     assert kinds["current_week_empty"] == "2026-07-12"
+
+
+def test_focus_never_lands_on_the_in_progress_week():
+    """Regression: `focus` (the TUI 'Now' tab) scanned reversed(weeks) for the first
+    needs_human state. The in-progress week is always empty -> always NEEDS_FILLING, so it won
+    every time and pinned the Now tab to a week whose days had not happened yet."""
+    cfg = Config(name="T", day_rate=500.0)
+    paths = DataPaths(root=Path("unused"))
+    recs = [_rec("2026-07-05", 5, "Approved"), _rec("2026-07-12", 0, "Draft"),
+            _rec("2026-07-19", 0, "Draft")]
+    view = build_view(recs, cfg, paths,
+                      billable_by_week={r.week_start: 5 for r in recs},
+                      now=datetime(2026, 7, 20, 9, 0), today=_TODAY)
+    assert view["focus"] == "2026-07-12"
+
+
+def test_focus_falls_back_to_latest_settled_week_when_nothing_needs_a_human():
+    cfg = Config(name="T", day_rate=500.0)
+    paths = DataPaths(root=Path("unused"))
+    recs = [_rec("2026-07-05", 5, "Approved"), _rec("2026-07-12", 5, "Approved"),
+            _rec("2026-07-19", 0, "Draft")]
+    view = build_view(recs, cfg, paths,
+                      billable_by_week={r.week_start: 5 for r in recs},
+                      now=datetime(2026, 7, 20, 9, 0), today=_TODAY)
+    assert view["focus"] == "2026-07-12"      # not the in-progress 19th

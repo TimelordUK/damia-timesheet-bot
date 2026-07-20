@@ -103,15 +103,23 @@ def save_runtime(paths: DataPaths, runtime: dict) -> None:
 
 # --------------------------------------------------------------------- state helpers
 
-def _billable_by_week(paths, config, records) -> dict:
+def _billable_by_week(paths, config, records, emit=None) -> dict:
+    """Billable days per week. On failure this returns {} and every week loses its billable-day
+    count, which makes `reconcile_week_state` unable to tell a full-leave week (NOTHING_TO_DO)
+    from an unfilled one — so it reports NEEDS_FILLING for both. That is exactly the kind of
+    silent mislabelling we must not hide: behind a corporate TLS proxy the gov.uk bank-holiday
+    fetch raises SSLError, and the provider only re-raises once its cache AND vendored snapshot
+    are both unusable. Surface it rather than swallowing it."""
     out: dict = {}
     try:
         leave = ConfigLeaveProvider.from_config(config)
         holidays = UkGovUkHolidayProvider(cache_dir=paths.root / "holidays")
         out = {r.week_start: build_week_plan(r.week_start, holidays, leave).billable_days
                for r in records}
-    except Exception:
-        pass
+    except Exception as e:
+        if emit is not None:
+            emit("warn", f"billable-day calc failed ({type(e).__name__}: {e}) — leave/bank-holiday "
+                         f"weeks may show as 'Needs filling'. Check the bank-holiday fetch.")
     return out
 
 
@@ -169,7 +177,9 @@ def run_tick(paths: DataPaths, config: Config, *, cdp_url: str, notifier, log) -
     # ---- reconcile FINAL state (fresh reads) + notify -------------------------------------
     records = CsvWeekCache(paths.csv_path).read()
     subs = store.all_by_week()
-    billable = _billable_by_week(paths, config, records)
+    # `emit` is passed only here: this runs exactly once per tick (even when paused), so a
+    # persistent bank-holiday/SSL failure warns once a tick instead of three times.
+    billable = _billable_by_week(paths, config, records, emit)
     snaps = _snapshots(records, subs, billable, now, target_week)
 
     if not paused:
