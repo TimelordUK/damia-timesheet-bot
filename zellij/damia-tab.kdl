@@ -17,6 +17,10 @@
 //                 into Damia. It NEVER sends and NEVER submits — it drafts + attaches only.
 // Floating panes (start_suspended, hidden by default — toggle with your floating-panes keybind):
 //   * chrome-cdp : Chrome with the CDP debug port + dedicated profile + Damia (the 136+ quirk).
+//                  Delegates to scripts/launch-chrome.ps1 rather than hard-coding chrome.exe —
+//                  the script resolves it from the registry App Paths and Program Files /
+//                  Program Files (x86) / LocalAppData, and derives the profile dir from
+//                  %LOCALAPPDATA%, so the same layout works on boxes with a 32-bit Chrome.
 //                  START THIS FIRST and log into Damia, THEN start the bot-agent pane.
 //   * hydrator   : `damia-bot hydrate` — force a full portal re-walk on demand.
 layout {
@@ -38,13 +42,13 @@ layout {
             plugin location="zellij:status-bar"
         }
         floating_panes {
-            pane name="chrome-cdp" command="C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" {
+            pane name="chrome-cdp" command="pwsh" {
                 start_suspended true
                 height 32
                 width 84
                 x 42
                 y 17
-                args "--remote-debugging-port=9222" "--user-data-dir=C:\\Users\\sjame\\AppData\\Local\\damia-timesheet-bot\\chrome-profile" "https://damia.timesheetportal.com/"
+                args "-NoLogo" "-NoExit" "-File" "scripts\\launch-chrome.ps1"
             }
             pane name="hydrator" command="uv" {
                 start_suspended true
