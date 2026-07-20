@@ -1,9 +1,14 @@
 // Damia bot — a NEW-TAB layout (not a full session layout). Mirrors the structure of the
 // user's real session layout (tab-bar / main / status-bar / floating_panes; start_suspended).
 //
-// Add it to a RUNNING zellij session (keeps your default layout + plugins intact):
-//     zellij action new-tab --layout zellij/damia-tab.kdl --name damia
-// or run  scripts/damia-tab.ps1  from inside zellij.
+// Add it to a RUNNING zellij session (keeps your default layout + plugins intact) by running
+//     scripts/damia-tab.ps1
+// from inside zellij. PREFER THE SCRIPT: this layout deliberately declares no `cwd`, so every
+// pane inherits the tab's working directory, and the script passes `--cwd <repo root>` resolved
+// from its own location. That keeps the layout free of machine-specific paths (the repo lives
+// under a different user's home at work). The raw equivalent, from the repo root:
+//     zellij action new-tab --cwd . --layout zellij/damia-tab.kdl --name damia
+// Relative paths below (e.g. scripts\launch-chrome.ps1) resolve against that cwd.
 //
 // A `new-tab --layout` does NOT inherit your new_tab_template, so this tab declares the
 // tab-bar (size=1) and status-bar (size=1) plugin panes itself — without them the tab
@@ -24,7 +29,6 @@
 //                  START THIS FIRST and log into Damia, THEN start the bot-agent pane.
 //   * hydrator   : `damia-bot hydrate` — force a full portal re-walk on demand.
 layout {
-    cwd "C:\\Users\\sjame\\dev\\damia-timesheet-bot"
     tab name="damia" focus=true hide_floating_panes=true {
         pane size=1 borderless=true {
             plugin location="zellij:tab-bar"

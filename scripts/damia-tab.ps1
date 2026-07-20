@@ -18,7 +18,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$layout = (Resolve-Path (Join-Path $PSScriptRoot "..\zellij\damia-tab.kdl")).Path
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$layout   = (Resolve-Path (Join-Path $repoRoot "zellij\damia-tab.kdl")).Path
 
 if (-not $env:ZELLIJ) {
     Write-Host "Not inside a zellij session." -ForegroundColor Yellow
@@ -28,5 +29,9 @@ if (-not $env:ZELLIJ) {
     exit 1
 }
 
-Write-Host "Adding tab '$Name' from $layout ..."
-zellij action new-tab --layout $layout --name $Name
+# The layout declares no `cwd` on purpose — it must not carry a machine-specific path. Pass the
+# repo root (resolved from this script's own location) so every pane, and every relative path
+# inside the layout, resolves correctly whatever the checkout location or user account.
+Write-Host "Adding tab '$Name' from $layout"
+Write-Host "  cwd: $repoRoot"
+zellij action new-tab --cwd $repoRoot --layout $layout --name $Name
