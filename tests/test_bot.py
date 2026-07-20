@@ -224,3 +224,40 @@ def test_focus_falls_back_to_latest_settled_week_when_nothing_needs_a_human():
                       billable_by_week={r.week_start: 5 for r in recs},
                       now=datetime(2026, 7, 20, 9, 0), today=_TODAY)
     assert view["focus"] == "2026-07-12"      # not the in-progress 19th
+
+
+# --------------------------------------------------- ATTACHED -> SUBMITTED portal detection
+
+_WK = date(2026, 7, 12)
+_NOW = datetime(2026, 7, 20, 9, 0)
+
+
+def test_attached_week_triggers_a_portal_recheck():
+    """Regression: only SUBMITTED re-read the portal, so after the human pressed Submit in Damia
+    the week sat on 'Proof attached' until the next daily full sweep."""
+    plan = plan_tick([WeekSnapshot(_WK, WeekState.ATTACHED)], now=_NOW)
+    assert plan.needs_portal
+    assert "submitted on the portal" in plan.portal_reason
+
+
+def test_attached_rechecks_on_the_fast_cadence():
+    # 1h default for ATTACHED: not due at 30m, due at 90m (the 6h SUBMITTED cadence would not be).
+    for age_h, expected in ((0.5, False), (1.5, True)):
+        plan = plan_tick([WeekSnapshot(_WK, WeekState.ATTACHED)], now=_NOW,
+                         last_portal_poll={_WK: _NOW - timedelta(hours=age_h)})
+        assert plan.needs_portal is expected, f"age={age_h}h"
+
+
+def test_submitted_stays_on_the_slow_cadence():
+    plan = plan_tick([WeekSnapshot(_WK, WeekState.SUBMITTED)], now=_NOW,
+                     last_portal_poll={_WK: _NOW - timedelta(hours=1.5)})
+    assert not plan.needs_portal          # agency decides on its own schedule
+    plan = plan_tick([WeekSnapshot(_WK, WeekState.SUBMITTED)], now=_NOW,
+                     last_portal_poll={_WK: _NOW - timedelta(hours=7)})
+    assert plan.needs_portal
+
+
+def test_states_waiting_on_a_human_or_manager_do_not_drive_the_portal():
+    for st in (WeekState.SENT_FOR_APPROVAL, WeekState.DRAFTED_IN_OUTLOOK, WeekState.MGR_QUERY):
+        plan = plan_tick([WeekSnapshot(_WK, st)], now=_NOW)
+        assert not plan.needs_portal, st

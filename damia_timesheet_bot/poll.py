@@ -25,6 +25,7 @@ from .adapters.state.csv_cache import CsvWeekCache
 from .adapters.state.submission_store import JsonSubmissionStore
 from .adapters.timesheet.damia_playwright import DEFAULT_CDP_URL, DamiaTimesheetDriver
 from .core.bot import (
+    PORTAL_RECHECK_STATES,
     HealthReport,
     SubsystemHealth,
     TickAction,
@@ -287,16 +288,19 @@ def _sense_and_act(paths, config, store, approval_cfg, health: HealthReport, odr
                 _log_result(emit, wk, "attach", res)
                 runtime.setdefault("last_portal_poll", {})[wk.isoformat()] = now.isoformat()
 
-        # Refresh status for SUBMITTED weeks awaiting the agency decision (light per-week read).
+        # Light per-week read for weeks whose portal status can move without us: SUBMITTED
+        # (agency decides) and ATTACHED (the human presses Submit in Damia). The portal is the
+        # only place either shows up, so without this an ATTACHED week stays on "Proof attached"
+        # even after it has been submitted.
         for s in snaps:
-            if s.state is WeekState.SUBMITTED:
+            if s.state in PORTAL_RECHECK_STATES:
                 try:
                     drv.navigate_to_week(s.week_start)
                     if drv.current_week_range()[0] == s.week_start:
                         _update_record_status(paths, s.week_start, drv.status_word())
                         runtime.setdefault("last_portal_poll", {})[s.week_start.isoformat()] = now.isoformat()
                 except Exception as e:
-                    emit("warn", f"{s.week_start}: agency-decision re-check failed ({type(e).__name__}).")
+                    emit("warn", f"{s.week_start}: portal status re-check failed ({type(e).__name__}).")
 
 
 def _log_result(emit, wk, kind, res) -> None:

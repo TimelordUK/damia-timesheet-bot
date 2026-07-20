@@ -97,6 +97,13 @@ class TickPlan:
 # state here can only ever cause a no-op, never a wrong action.
 _DRAFT_STATES = (WeekState.NEEDS_FILLING, WeekState.READY_TO_DRAFT)
 
+# States whose portal status can change with NO involvement from the bot, so re-reading the
+# portal is the only way to find out:
+#   SUBMITTED — the agency approves/rejects on their own schedule.
+#   ATTACHED  — the human presses Submit in Damia. Without this the week sat on "Proof attached"
+#               until the next daily full sweep, even though the portal already said Submitted.
+PORTAL_RECHECK_STATES = (WeekState.SUBMITTED, WeekState.ATTACHED)
+
 
 def plan_tick(
     snapshots: "list[WeekSnapshot]",
@@ -104,6 +111,7 @@ def plan_tick(
     now: datetime,
     last_portal_poll: dict[date, datetime] | None = None,
     portal_recheck_hours: float = 6.0,
+    attached_recheck_hours: float = 1.0,
     force_full_sweep: bool = False,
 ) -> TickPlan:
     """Given each managed week's derived state, choose ≤1 mechanical action per week and decide
@@ -120,11 +128,20 @@ def plan_tick(
         elif s.state is WeekState.MGR_APPROVED:
             intents.append(WeekIntent(s.week_start, TickAction.ATTACH,
                                       "manager approved — attach proof + save draft"))
-        elif s.state is WeekState.SUBMITTED:
+        elif s.state in PORTAL_RECHECK_STATES:
+            # ATTACHED re-checks more often than SUBMITTED: it is an open human gate the user has
+            # just been nudged about, so the Submit can land at any moment and they expect the
+            # board to notice. A SUBMITTED week is waiting on the agency's own schedule — days,
+            # not minutes — so it stays on the slow cadence to avoid pointless portal navigation.
+            every = (attached_recheck_hours if s.state is WeekState.ATTACHED
+                     else portal_recheck_hours)
             last = last_portal_poll.get(s.week_start)
-            due = last is None or (now - last).total_seconds() / 3600.0 >= portal_recheck_hours
+            due = last is None or (now - last).total_seconds() / 3600.0 >= every
             if due:
-                portal_reasons.append(f"{s.week_start} submitted — re-check agency decision")
+                why = ("submitted — re-check agency decision"
+                       if s.state is WeekState.SUBMITTED
+                       else "proof attached — check whether it has been submitted on the portal")
+                portal_reasons.append(f"{s.week_start} {why}")
 
     if force_full_sweep:
         portal_reasons.insert(0, "startup/rollover — full reverse walk")
