@@ -16,6 +16,8 @@ from damia_timesheet_bot.core.bot import (
     pending_human,
     plan_tick,
 )
+from damia_timesheet_bot.core.hydrate import _derive_actions
+from damia_timesheet_bot.core.models import WeekRecord
 from damia_timesheet_bot.core.state import WeekState
 
 NOW = datetime(2026, 7, 6, 9, 0, 0)  # a Monday morning
@@ -147,3 +149,49 @@ def test_renudge_respects_cooldown():
 
 def test_renudge_ignores_non_gate_states():
     assert due_renudges([WeekSnapshot(WK, WeekState.SENT_FOR_APPROVAL)], {}, NOW) == []
+
+
+# --------------------------------------------------------------- hydrate action targeting
+
+def _rec(week_start: str, units: float, status: str) -> WeekRecord:
+    s = date.fromisoformat(week_start)
+    return WeekRecord(week_start=s, week_end=s + timedelta(days=6), status=status,
+                      total_units=units, worked_days=int(units), day_units=(0.0,) * 7)
+
+
+# Monday 20 Jul 2026 -> Damia week-start Sun 19 Jul (in progress), target Sun 12 Jul.
+_TODAY = date(2026, 7, 20)
+
+
+def test_actions_target_last_completed_week_not_the_in_progress_one():
+    """Regression: the banner used to name records[-1] (the in-progress week), so from Sunday
+    onwards it nagged 'this week is empty' about days that had not happened yet, hiding the
+    previous week that actually needed work."""
+    actions = _derive_actions(
+        [_rec("2026-07-12", 0, "Draft"), _rec("2026-07-19", 0, "Draft")], today=_TODAY)
+    weeks = {a["week"] for a in actions}
+    assert "2026-07-19" not in weeks          # in-progress week stays silent
+    assert weeks == {"2026-07-12"}
+    assert actions[0]["kind"] == "current_week_empty"
+
+
+def test_in_progress_week_never_raises_an_action_even_when_filled():
+    actions = _derive_actions(
+        [_rec("2026-07-12", 5, "Submitted"), _rec("2026-07-19", 3, "Draft")], today=_TODAY)
+    assert [a for a in actions if a["week"] == "2026-07-19"] == []
+
+
+def test_filled_target_week_is_ready_to_submit():
+    actions = _derive_actions(
+        [_rec("2026-07-12", 5, "Draft"), _rec("2026-07-19", 0, "Draft")], today=_TODAY)
+    assert [a["kind"] for a in actions] == ["current_week_ready"]
+    assert actions[0]["week"] == "2026-07-12"
+
+
+def test_older_unsubmitted_filled_weeks_still_flagged():
+    actions = _derive_actions(
+        [_rec("2026-07-05", 5, "Draft"), _rec("2026-07-12", 0, "Draft"),
+         _rec("2026-07-19", 0, "Draft")], today=_TODAY)
+    kinds = {a["kind"]: a["week"] for a in actions}
+    assert kinds["unsubmitted_filled_week"] == "2026-07-05"
+    assert kinds["current_week_empty"] == "2026-07-12"

@@ -11,7 +11,7 @@ Revenue stats and action items are computed here, not in the UI.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -20,6 +20,7 @@ from .config import Config
 from .models import WeekRecord
 from .paths import DataPaths
 from .state import derive_events, reconcile_week_state, state_label, state_tone, WeekState
+from .weekplan import sunday_of
 
 if TYPE_CHECKING:
     from .ports import TimesheetDriver
@@ -87,15 +88,26 @@ def hydrate(
     return records
 
 
-def _derive_actions(records: list[WeekRecord]) -> list[dict]:
-    """The 'what do I still owe?' list. Pure function over the records."""
+def _derive_actions(records: list[WeekRecord], *, today: date | None = None) -> list[dict]:
+    """The 'what do I still owe?' list. Pure function over the records.
+
+    The actionable week is the last COMPLETED one (`sunday_of(today) - 7`), matching the poll
+    loop's `target_week`. The in-progress week is deliberately silent: you cannot fill or submit
+    days that have not happened yet, and nagging about it every tick from Sunday onwards buried
+    the real signal — the previous week still needing work.
+    """
     actions: list[dict] = []
     if not records:
         return actions
-    latest = records[-1]
+    target_week = sunday_of(today or date.today()) - timedelta(days=7)
+    # Anything at or before the target is fair game; later weeks are still in progress.
+    settled = [r for r in records if r.week_start <= target_week]
+    if not settled:
+        return actions
+    target = next((r for r in settled if r.week_start == target_week), None)
 
-    for r in records:
-        if r.status.lower() in ("draft", "rejected") and r.total_units > 0 and r is not latest:
+    for r in settled:
+        if r.status.lower() in ("draft", "rejected") and r.total_units > 0 and r is not target:
             actions.append({
                 "kind": "unsubmitted_filled_week",
                 "week": r.week_start.isoformat(),
@@ -103,19 +115,19 @@ def _derive_actions(records: list[WeekRecord]) -> list[dict]:
                            f"{r.status} — not submitted.",
             })
 
-    if latest.status.lower() in ("draft", "rejected"):
-        if latest.total_units == 0:
+    if target is not None and target.status.lower() in ("draft", "rejected"):
+        if target.total_units == 0:
             actions.append({
                 "kind": "current_week_empty",
-                "week": latest.week_start.isoformat(),
-                "message": f"This week {latest.week_start} is empty — needs filling.",
+                "week": target.week_start.isoformat(),
+                "message": f"Week {target.week_start} is empty — needs filling.",
             })
         else:
             actions.append({
                 "kind": "current_week_ready",
-                "week": latest.week_start.isoformat(),
-                "message": f"This week {latest.week_start} is filled "
-                           f"({latest.total_units:g}d, {latest.status}) — ready to submit.",
+                "week": target.week_start.isoformat(),
+                "message": f"Week {target.week_start} is filled "
+                           f"({target.total_units:g}d, {target.status}) — ready to submit.",
             })
 
     for r in records:
