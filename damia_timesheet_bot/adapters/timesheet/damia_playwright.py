@@ -111,7 +111,9 @@ class DamiaTimesheetDriver:
 
     # ---- lifecycle --------------------------------------------------------
 
-    def attach(self) -> DamiaTimesheetDriver:
+    def attach(self, *, require_timesheet: bool = True) -> DamiaTimesheetDriver:
+        """Connect to the Damia tab. `require_timesheet=False` stops there, for session checks
+        that must work on a login page, where there is no timesheet to discover."""
         try:
             requests.get(f"{self.cdp_url}/json/version", timeout=2).raise_for_status()
         except Exception as e:
@@ -130,6 +132,8 @@ class DamiaTimesheetDriver:
 
         self._page = self._find_damia_page()
         self._page.on("dialog", lambda d: None)
+        if not require_timesheet:
+            return self
         try:
             self._page.wait_for_load_state("domcontentloaded", timeout=10000)
             self._page.wait_for_selector("[id^='tsEntriesWrapper_']", timeout=10000)
@@ -158,8 +162,8 @@ class DamiaTimesheetDriver:
         self.timesheet_id = None
 
     @contextmanager
-    def attached(self) -> Iterator[DamiaTimesheetDriver]:
-        self.attach()
+    def attached(self, *, require_timesheet: bool = True) -> Iterator[DamiaTimesheetDriver]:
+        self.attach(require_timesheet=require_timesheet)
         try:
             yield self
         finally:
@@ -181,6 +185,40 @@ class DamiaTimesheetDriver:
             f"No tab found with URL containing {DAMIA_URL_FRAGMENT!r}. "
             "Open the Damia timesheet tab in the CDP-launched Chrome and retry."
         )
+
+    # ---- session ----------------------------------------------------------
+
+    def keep_alive(self) -> bool:
+        """Renew the portal session and report whether it is still logged in. Issues a background
+        same-origin GET from inside the tab, so the session cookie applies and the DOM is untouched:
+        a real reload would throw away whatever the user is typing and jump the page to another
+        week. Logged-out is recognised positively, by a password field in the live page (already
+        bounced to the login screen) or in the response (the next navigation would bounce), or by
+        Damia's timed-out popup already being up.
+
+        The GET alone isn't enough. Damia's page runs its own 55-minute timer that raises that
+        popup whatever the server thinks, and only a page load restarts it, so once the server has
+        confirmed the session we restart it through the page's own refreshTimeout()."""
+        result = self.page.evaluate(
+            """async () => {
+              const pw = /<input[^>]+type=["']?password/i;
+              if (document.querySelector('input[type=password]')
+                  || document.body.innerText.includes('session has timed out')) {
+                return {live_login: true};
+              }
+              const r = await fetch(location.href, {credentials: 'include', cache: 'no-store'});
+              const login = pw.test(await r.text());
+              if (r.status === 200 && !login && typeof window.refreshTimeout === 'function') {
+                window.refreshTimeout();
+              }
+              return {status: r.status, login};
+            }"""
+        )
+        if result.get("live_login") or result.get("login"):
+            return False
+        if result.get("status") != 200:
+            raise RuntimeError(f"portal keep-alive got HTTP {result.get('status')}")
+        return True
 
     # ---- timesheet-id discovery -------------------------------------------
 

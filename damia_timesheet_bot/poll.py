@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import time
 import urllib.request
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 
 from .adapters.email.outlook_com import OutlookComEmailDriver
@@ -44,6 +45,11 @@ from .core.weekplan import build_week_plan, sunday_of
 from .runner import locate_proof, run_attach, run_draft, run_watch_week
 
 
+# Often enough to outlast any plausible session timeout, rare enough to be invisible. It runs on
+# the tick, so the real period is this rounded up to a multiple of --interval.
+KEEPALIVE_SECONDS = 300.0
+
+
 # --------------------------------------------------------------------- health probes
 
 def _probe_cdp(cdp_url: str, timeout: float = 2.0) -> SubsystemHealth:
@@ -61,6 +67,35 @@ def _probe_cdp(cdp_url: str, timeout: float = 2.0) -> SubsystemHealth:
                                error=f"no debug Chrome at {cdp_url} ({type(e).__name__})")
 
 
+def _probe_portal(cdp_url: str) -> SubsystemHealth:
+    """Renew the Damia session and report whether it is still logged in."""
+    try:
+        with DamiaTimesheetDriver(cdp_url=cdp_url).attached(require_timesheet=False) as drv:
+            if drv.keep_alive():
+                return SubsystemHealth(ok=True, detail="logged in")
+        return SubsystemHealth(ok=False, error="Damia session expired — log in again in the debug Chrome")
+    except Exception as e:
+        return SubsystemHealth(ok=False, error=f"Damia not reachable ({type(e).__name__}: {e})")
+
+
+def probe_local(cdp_url: str) -> dict:
+    """Health as the TUI can see it for itself, for a board that must be right without the loop.
+    Never launches Outlook: unlike the loop's probe this only looks for a running instance. Meant
+    for a worker thread, hence the COM initialisation. Returns the `HealthReport.to_dict` shape."""
+    import pythoncom
+    import win32com.client
+    pythoncom.CoInitialize()
+    try:
+        try:
+            win32com.client.GetActiveObject("Outlook.Application")
+            outlook = SubsystemHealth(ok=True, detail="classic Outlook (COM)")
+        except Exception as e:
+            outlook = SubsystemHealth(ok=False, error=f"classic Outlook not running ({type(e).__name__})")
+    finally:
+        pythoncom.CoUninitialize()
+    return {"outlook": outlook.to_dict(), "chrome_cdp": _probe_cdp(cdp_url).to_dict()}
+
+
 def _probe_outlook() -> tuple[SubsystemHealth, OutlookComEmailDriver | None]:
     """Can we reach classic Outlook over COM? Returns the health plus the connected driver to
     reuse this tick (so we connect once)."""
@@ -69,6 +104,26 @@ def _probe_outlook() -> tuple[SubsystemHealth, OutlookComEmailDriver | None]:
         return SubsystemHealth(ok=True, detail="classic Outlook (COM)"), drv
     except Exception as e:
         return SubsystemHealth(ok=False, error=f"classic Outlook not reachable ({type(e).__name__}: {e})"), None
+
+
+def _portal_health(cdp_url: str, *, chrome_ok: bool, paused: bool, runtime: dict, now: datetime,
+                   force: bool) -> SubsystemHealth | None:
+    """This tick's portal health, renewing the session when the keep-alive is due. Otherwise
+    reuses the last answer, except that a dead session is re-checked every tick so logging back in
+    shows up at once. Records the result in `runtime`. None = unknown: there is no Chrome to ask,
+    or the bot is paused and so must keep its hands off the tab."""
+    if paused or not chrome_ok:
+        runtime["last_keepalive"] = None
+        return None
+    last = runtime.get("last_keepalive")
+    prev = runtime.get("portal")
+    age = (now - datetime.fromisoformat(last)).total_seconds() if last else None
+    if not force and prev is not None and prev["ok"] and age is not None and age < KEEPALIVE_SECONDS:
+        return SubsystemHealth(**prev)
+    health = _probe_portal(cdp_url)
+    runtime["last_keepalive"] = now.isoformat()
+    runtime["portal"] = health.to_dict()
+    return health
 
 
 def probe_health(cdp_url: str) -> tuple[HealthReport, OutlookComEmailDriver | None]:
@@ -83,7 +138,8 @@ def probe_health(cdp_url: str) -> tuple[HealthReport, OutlookComEmailDriver | No
 # --------------------------------------------------------------------- runtime memory
 
 _EMPTY_RUNTIME = {"tick_seq": 0, "last_notified": {}, "last_nudged": {},
-                  "last_portal_poll": {}, "last_sweep_date": None}
+                  "last_portal_poll": {}, "last_sweep_date": None,
+                  "last_keepalive": None, "portal": None}
 
 
 def load_runtime(paths: DataPaths) -> dict:
@@ -143,9 +199,11 @@ def _snapshots(records, subs, billable, now, target_week) -> list[WeekSnapshot]:
 
 # --------------------------------------------------------------------- one tick
 
-def run_tick(paths: DataPaths, config: Config, *, cdp_url: str, notifier, log) -> dict:
+def run_tick(paths: DataPaths, config: Config, *, cdp_url: str, notifier, log,
+             check_portal_now: bool = False) -> dict:
     """Execute one full tick. Returns the `bot` block for view.json. Never raises out of a phase —
-    a failure is logged into messages and the loop continues."""
+    a failure is logged into messages and the loop continues. `check_portal_now` skips the
+    keep-alive timer, so a new process doesn't trust what the last one recorded."""
     now = datetime.now()
     runtime = load_runtime(paths)
     runtime["tick_seq"] = int(runtime.get("tick_seq", 0)) + 1
@@ -157,9 +215,21 @@ def run_tick(paths: DataPaths, config: Config, *, cdp_url: str, notifier, log) -
 
     paused = paths.pause_flag.exists()
     health, odrv = probe_health(cdp_url)
+    was_logged_in = (runtime.get("portal") or {}).get("ok")
+    portal = _portal_health(cdp_url, chrome_ok=health.chrome_cdp.ok, paused=paused, runtime=runtime,
+                            now=now, force=check_portal_now)
+    health = replace(health, portal=portal)
     emit("info", f"tick {runtime['tick_seq']}  outlook={'ok' if health.outlook.ok else 'DOWN'}  "
-                 f"chrome={'ok' if health.chrome_cdp.ok else 'DOWN'}"
+                 f"chrome={'ok' if health.chrome_cdp.ok else 'DOWN'}  "
+                 f"portal={'?' if portal is None else 'ok' if portal.ok else 'DOWN'}"
                  + ("  [PAUSED]" if paused else ""))
+    if portal is not None and not portal.ok and was_logged_in:
+        notifier.notify("Damia session expired", "Log in again in the debug Chrome so the bot can work.")
+        emit("warn", portal.error)
+    # Publish before the slow part of the tick: a portal walk can take minutes, and until now the
+    # board would be showing whatever the previous tick (or previous session) left behind.
+    _patch_bot(paths, tick_seq=runtime["tick_seq"], last_tick_at=now.isoformat(timespec="seconds"),
+               next_tick_at=None, paused=paused, health=health.to_dict())
 
     store = JsonSubmissionStore(paths.submissions_json)
     approval_cfg = ApprovalConfig.from_dict(config.approval)
@@ -240,18 +310,21 @@ def _sense_and_act(paths, config, store, approval_cfg, health: HealthReport, odr
     if not plan.needs_portal:
         emit("info", "no portal work this tick (Outlook-only).")
         return
-    if not health.chrome_cdp.ok:
-        emit("warn", f"portal work needed ({plan.portal_reason or 'draft/attach'}) but the debug "
-                     f"Chrome is down — start it. Nudging only this tick.")
+    if not health.can_drive_portal:
+        why = ("the debug Chrome is down — start it" if not health.chrome_cdp.ok
+               else "the Damia session is logged out — log in")
+        emit("warn", f"portal work needed ({plan.portal_reason or 'draft/attach'}) but {why}. "
+                     f"Nudging only this tick.")
         return
 
     runtime["_drove_chrome"] = True
     with DamiaTimesheetDriver(cdp_url=cdp_url).attached() as drv:
-        # Full reverse walk (startup / new day): rebuild the whole summary from portal truth.
+        # Reverse walk (startup / new day), only as far back as weeks can still change.
         if force_full_sweep:
-            emit("info", "full reverse walk (rebuilding the complete summary from the portal).")
+            emit("info", "portal sweep (walking back to the last settled week).")
             try:
-                fresh = hydrate(drv, paths, download_pdf=True, pull_attachments=True, log=lambda *_: None)
+                fresh = hydrate(drv, paths, download_pdf=True, pull_attachments=True,
+                                known=CsvWeekCache(paths.csv_path).read(), log=lambda *_: None)
                 CsvWeekCache(paths.csv_path).write(fresh)
                 runtime["last_sweep_date"] = today_iso
             except Exception as e:
@@ -297,7 +370,8 @@ def _sense_and_act(paths, config, store, approval_cfg, health: HealthReport, odr
                 try:
                     drv.navigate_to_week(s.week_start)
                     if drv.current_week_range()[0] == s.week_start:
-                        _update_record_status(paths, s.week_start, drv.status_word())
+                        if _update_record_status(paths, s.week_start, drv.status_word()):
+                            runtime["last_sweep_date"] = None   # re-archive it on the next tick
                         runtime.setdefault("last_portal_poll", {})[s.week_start.isoformat()] = now.isoformat()
                 except Exception as e:
                     emit("warn", f"{s.week_start}: portal status re-check failed ({type(e).__name__}).")
@@ -309,13 +383,21 @@ def _log_result(emit, wk, kind, res) -> None:
     emit(level, f"{wk}: {kind} {'ok' if res.ok else 'ABORTED'} — {tail}")
 
 
-def _update_record_status(paths, week_start: date, status: str) -> None:
+def _update_record_status(paths, week_start: date, status: str) -> bool:
+    """Record a status read from the portal. Returns True if it moved. A moved week loses its PDF,
+    which predates the move: that is what stops `is_settled` skipping a week that has just become
+    Approved before its final PDF and attachments have been archived."""
     cache = CsvWeekCache(paths.csv_path)
     records = cache.read()
+    changed = False
     for r in records:
-        if r.week_start == week_start:
+        if r.week_start == week_start and r.status != status:
             r.status = status
-    cache.write(records)
+            r.pdf_path = None
+            changed = True
+    if changed:
+        cache.write(records)
+    return changed
 
 
 def _notify(snaps, runtime, now, notifier, emit) -> None:
@@ -351,14 +433,19 @@ def poll_loop(paths: DataPaths, config: Config, *, cdp_url: str, interval: float
     notifier = make_notifier(enabled=notify_enabled)
     log(f">>> damia-bot poll — every {interval:g}s, data root {paths.root}")
     log("    NEVER sends, NEVER submits. Ctrl-C to stop.\n")
+    if interval > KEEPALIVE_SECONDS:
+        log(f"    [note] keep-alive runs on the tick, so only every {interval:g}s at this interval.")
+    first = True
     try:
         while True:
-            bot = run_tick(paths, config, cdp_url=cdp_url, notifier=notifier, log=log)
+            bot = run_tick(paths, config, cdp_url=cdp_url, notifier=notifier, log=log,
+                           check_portal_now=first)
+            first = False
             if once:
                 return 0
             nxt = datetime.now() + timedelta(seconds=interval)
             # stamp next_tick into the written view so the TUI can show a countdown
-            _stamp_next_tick(paths, nxt)
+            _patch_bot(paths, next_tick_at=nxt.isoformat(timespec="seconds"))
             log(f"    next tick ~{nxt.strftime('%H:%M:%S')}  (focus health: "
                 f"{'ready' if bot['health']['can_work_fully'] else 'DEGRADED'})")
             time.sleep(interval)
@@ -367,11 +454,11 @@ def poll_loop(paths: DataPaths, config: Config, *, cdp_url: str, interval: float
         return 0
 
 
-def _stamp_next_tick(paths: DataPaths, nxt: datetime) -> None:
+def _patch_bot(paths: DataPaths, **fields) -> None:
+    """Merge `fields` into the written view's bot block, for updates between full view rebuilds."""
     try:
         data = json.loads(paths.view_json.read_text(encoding="utf-8"))
-        if "bot" in data:
-            data["bot"]["next_tick_at"] = nxt.isoformat(timespec="seconds")
-            paths.view_json.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+        data["bot"] = {**data.get("bot", {}), **fields}
+        paths.view_json.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
     except Exception:
         pass

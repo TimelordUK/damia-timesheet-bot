@@ -27,7 +27,7 @@
 //                  Program Files (x86) / LocalAppData, and derives the profile dir from
 //                  %LOCALAPPDATA%, so the same layout works on boxes with a 32-bit Chrome.
 //                  START THIS FIRST and log into Damia, THEN start the bot-agent pane.
-//   * hydrator   : `damia-bot hydrate` — force a full portal re-walk on demand.
+//   * hydrator   : `damia-bot hydrate --full` — force a full portal re-walk on demand.
 layout {
     tab name="damia" focus=true hide_floating_panes=true {
         pane size=1 borderless=true {
@@ -60,7 +60,7 @@ layout {
                 width 84
                 x 42
                 y 2
-                args "run" "damia-bot" "hydrate"
+                args "run" "damia-bot" "hydrate" "--full"
             }
         }
     }

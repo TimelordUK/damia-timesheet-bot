@@ -1,7 +1,8 @@
 """Hydration orchestrator + projection.
 
-hydrate(): walk the timesheet driver backwards from the current week to the job's first
-week, building one WeekRecord per week (portal truth) and archiving PDFs + attachments.
+hydrate(): walk the timesheet driver backwards from the current week, building one WeekRecord
+per week (portal truth) and archiving PDFs + attachments. With `known` records it stops once
+everything older is settled (a delta walk); without them it walks to the job's first week.
 
 build_view(): pure projection over the records + config → a single render-state dict
 (written as cache/view.json). This is the ONLY thing the future Textual TUI reads — the
@@ -26,19 +27,52 @@ if TYPE_CHECKING:
     from .ports import TimesheetDriver
 
 
+# An unfilled sheet this far back is leave or a gap, not a week still in progress.
+_EMPTY_WEEK_SETTLES_AFTER_DAYS = 35
+
+
+def is_settled(record: WeekRecord, *, today: date | None = None) -> bool:
+    """Can a walk skip this week? True once nothing further can happen to it: Approved with its
+    PDF archived (without the PDF it still needs a visit), or an old sheet left empty, so that a
+    single leave week doesn't drag every walk back behind it."""
+    status = record.status.lower()
+    if status == "approved":
+        return record.pdf_path is not None and Path(record.pdf_path).exists()
+    age = ((today or date.today()) - record.week_start).days
+    return (status in ("new", "draft") and record.total_units == 0
+            and age > _EMPTY_WEEK_SETTLES_AFTER_DAYS)
+
+
+def sweep_floor(known: list[WeekRecord], *, today: date | None = None) -> date | None:
+    """The oldest week a delta walk must re-read: the first that is unsettled or follows a hole in
+    the cache, or the newest cached week when all are settled. None (no cache) means a full walk."""
+    by_week = {r.week_start: r for r in known}
+    if not by_week:
+        return None
+    weeks = sorted(by_week)
+    for prev, wk in zip([None, *weeks], weeks):
+        if (prev is not None and wk - prev != timedelta(days=7)) \
+                or not is_settled(by_week[wk], today=today):
+            return wk
+    return weeks[-1]
+
+
 def hydrate(
     driver: "TimesheetDriver",
     paths: DataPaths,
     *,
     download_pdf: bool = True,
     pull_attachments: bool = True,
-    max_weeks: int = 60,
+    max_weeks: int = 260,
+    known: list[WeekRecord] | None = None,
     log: Callable[[str], None] = print,
 ) -> list[WeekRecord]:
-    """Walk current → first week, recording each. Self-terminates when the driver refuses
-    to step before the job's contract start (step_to_prev_week returns False). Read-only:
-    navigates and downloads only."""
+    """Walk back from the current week, recording each, and return the whole job's records.
+    Pass the cached records as `known` to stop at `sweep_floor` and keep the older rows as they
+    are; otherwise the walk runs until the driver refuses to step before the contract start
+    (step_to_prev_week returns False). Read-only: navigates and downloads only."""
     paths.ensure_cache()
+    floor = sweep_floor(known or [])
     driver.navigate_to_current_week()
     now = datetime.now()
     records: list[WeekRecord] = []
@@ -78,14 +112,18 @@ def hydrate(
         log(f"  {start} → {end}  {status:10} {week.total_units:>4g}d  "
             f"pdf={'y' if pdf_path else '-'}  att={len(atts)}")
 
+        if floor is not None and start <= floor:
+            log(f">>> Older weeks are settled; stopped at {start}.")
+            break
         if not driver.step_to_prev_week():
             log(f">>> Reached the job start ({start}); walk complete.")
             break
     else:
         log(f"[warn] hit max_weeks={max_weeks} without reaching the job start.")
 
-    records.sort(key=lambda r: r.week_start)
-    return records
+    oldest_walked = records[-1].week_start
+    kept = {r.week_start: r for r in (known or []) if r.week_start < oldest_walked}
+    return sorted([*kept.values(), *records], key=lambda r: r.week_start)
 
 
 def _derive_actions(records: list[WeekRecord], *, today: date | None = None) -> list[dict]:

@@ -99,7 +99,7 @@ Run from the repo root with Chrome (CDP) + classic Outlook open. `--week` accept
 
 | # | Command | What it does |
 |---|---------|--------------|
-| 1 | `uv run damia-bot hydrate` | Walk the portal back to the contract start; rebuild `cache/` (CSV + PDFs + approval JPEGs) + `view.json`. **Run this first on a new machine.** |
+| 1 | `uv run damia-bot hydrate` | Walk the portal back to the contract start and build `cache/` (CSV + PDFs + approval JPEGs) + `view.json`. **Run this first on a new machine.** Later runs stop at the last settled week (Approved with its PDF archived); `--full` forces the whole walk, e.g. if an old week was changed on the portal. |
 | 2 | `uv run damia-bot plan --week <date>` | Read-only preview: the planned week (leave + bank holidays) and the circuit-breaker decision. No portal/Outlook writes. |
 | 3 | `uv run damia-bot draft --week <date>` | Fill the week (Save draft), screenshot the **whole portal page**, and create the **Outlook draft** with the screenshot embedded + a `[TS:…]` subject. Records the submission. **Never sends.** |
 | — | *You* review the draft in Outlook and **send it**. | |
