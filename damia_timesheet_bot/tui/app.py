@@ -219,7 +219,7 @@ class DamiaTUI(App):
         nxt = bot.get("next_tick_at")
         ping = bot.get("last_keepalive")
         ping_result = bot.get("last_keepalive_result") or "?"
-        if "NOT reset" in ping_result:
+        if "NOT reset" in ping_result or "popup will fire" in ping_result:
             ping_result = f"[yellow b]{ping_result}[/yellow b]"
         widget.update(
             f"[b]Bot[/b] tick {bot.get('tick_seq', '?')} · {ready}{paused}   {marks}\n"

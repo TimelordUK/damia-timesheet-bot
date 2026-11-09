@@ -229,7 +229,8 @@ def run_tick(paths: DataPaths, config: Config, *, cdp_url: str, notifier, log,
                  f"portal={'?' if portal is None else 'ok' if portal.ok else 'DOWN'}"
                  + ("  [PAUSED]" if paused else ""))
     if pinged:
-        emit("info" if portal.ok and "NOT reset" not in portal.detail else "warn",
+        worrying = "NOT reset" in portal.detail or "popup will fire" in portal.detail
+        emit("info" if portal.ok and not worrying else "warn",
              f"keep-alive sent → {portal.detail or portal.error}")
     if portal is not None and not portal.ok and was_logged_in:
         notifier.notify("Damia session expired", "Log in again in the debug Chrome so the bot can work.")
