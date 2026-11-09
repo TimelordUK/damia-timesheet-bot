@@ -188,8 +188,9 @@ class DamiaTimesheetDriver:
 
     # ---- session ----------------------------------------------------------
 
-    def keep_alive(self) -> bool:
-        """Renew the portal session and report whether it is still logged in. Issues a background
+    def keep_alive(self) -> tuple[bool, str]:
+        """Renew the portal session and report whether it is still logged in, with a note on what
+        came back. Issues a background
         same-origin GET from inside the tab, so the session cookie applies and the DOM is untouched:
         a real reload would throw away whatever the user is typing and jump the page to another
         week. Logged-out is recognised positively, by a password field in the live page (already
@@ -208,17 +209,23 @@ class DamiaTimesheetDriver:
               }
               const r = await fetch(location.href, {credentials: 'include', cache: 'no-store'});
               const login = pw.test(await r.text());
-              if (r.status === 200 && !login && typeof window.refreshTimeout === 'function') {
+              const has_timer = typeof window.refreshTimeout === 'function';
+              if (r.status === 200 && !login && has_timer) {
                 window.refreshTimeout();
               }
-              return {status: r.status, login};
+              return {status: r.status, login, has_timer};
             }"""
         )
-        if result.get("live_login") or result.get("login"):
-            return False
+        if result.get("live_login"):
+            return False, "page already showing the login / timed-out popup"
+        if result.get("login"):
+            return False, f"HTTP {result.get('status')} but the server answered with the login page"
         if result.get("status") != 200:
             raise RuntimeError(f"portal keep-alive got HTTP {result.get('status')}")
-        return True
+        # Without refreshTimeout the server session lives but the page's own timer still fires.
+        timer = ("page timer reset" if result.get("has_timer")
+                 else "page timer NOT reset (no refreshTimeout on the page)")
+        return True, f"HTTP 200, {timer}"
 
     # ---- timesheet-id discovery -------------------------------------------
 

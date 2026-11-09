@@ -217,10 +217,16 @@ class DamiaTUI(App):
         paused = "  [yellow b]⏸ PAUSED[/yellow b]" if bot.get("paused") else ""
         last = bot.get("last_tick_at", "?")
         nxt = bot.get("next_tick_at")
+        ping = bot.get("last_keepalive")
+        ping_result = bot.get("last_keepalive_result") or "?"
+        if "NOT reset" in ping_result:
+            ping_result = f"[yellow b]{ping_result}[/yellow b]"
         widget.update(
             f"[b]Bot[/b] tick {bot.get('tick_seq', '?')} · {ready}{paused}   {marks}\n"
             f"[dim]last tick {last}{('  ·  next ~' + nxt) if nxt else ''}  ·  "
             f"never sends · never submits[/dim]"
+            + (f"\n[dim]Damia ping {ping[11:16]} → {ping_result}[/dim]" if ping else
+               "\n[dim]Damia ping: none yet[/dim]")
         )
 
     def _render_now(self, view: dict) -> None:

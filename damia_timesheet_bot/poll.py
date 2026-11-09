@@ -71,9 +71,11 @@ def _probe_portal(cdp_url: str) -> SubsystemHealth:
     """Renew the Damia session and report whether it is still logged in."""
     try:
         with DamiaTimesheetDriver(cdp_url=cdp_url).attached(require_timesheet=False) as drv:
-            if drv.keep_alive():
-                return SubsystemHealth(ok=True, detail="logged in")
-        return SubsystemHealth(ok=False, error="Damia session expired — log in again in the debug Chrome")
+            logged_in, note = drv.keep_alive()
+            if logged_in:
+                return SubsystemHealth(ok=True, detail=f"logged in — {note}")
+        return SubsystemHealth(ok=False, detail=note,
+                               error="Damia session expired — log in again in the debug Chrome")
     except Exception as e:
         return SubsystemHealth(ok=False, error=f"Damia not reachable ({type(e).__name__}: {e})")
 
@@ -216,20 +218,28 @@ def run_tick(paths: DataPaths, config: Config, *, cdp_url: str, notifier, log,
     paused = paths.pause_flag.exists()
     health, odrv = probe_health(cdp_url)
     was_logged_in = (runtime.get("portal") or {}).get("ok")
+    pinged_before = runtime.get("last_keepalive")
     portal = _portal_health(cdp_url, chrome_ok=health.chrome_cdp.ok, paused=paused, runtime=runtime,
                             now=now, force=check_portal_now)
     health = replace(health, portal=portal)
+    # A tick that reuses the last answer logs the same portal=ok, so say when we actually pinged.
+    pinged = portal is not None and runtime.get("last_keepalive") != pinged_before
     emit("info", f"tick {runtime['tick_seq']}  outlook={'ok' if health.outlook.ok else 'DOWN'}  "
                  f"chrome={'ok' if health.chrome_cdp.ok else 'DOWN'}  "
                  f"portal={'?' if portal is None else 'ok' if portal.ok else 'DOWN'}"
                  + ("  [PAUSED]" if paused else ""))
+    if pinged:
+        emit("info" if portal.ok and "NOT reset" not in portal.detail else "warn",
+             f"keep-alive sent → {portal.detail or portal.error}")
     if portal is not None and not portal.ok and was_logged_in:
         notifier.notify("Damia session expired", "Log in again in the debug Chrome so the bot can work.")
         emit("warn", portal.error)
     # Publish before the slow part of the tick: a portal walk can take minutes, and until now the
     # board would be showing whatever the previous tick (or previous session) left behind.
     _patch_bot(paths, tick_seq=runtime["tick_seq"], last_tick_at=now.isoformat(timespec="seconds"),
-               next_tick_at=None, paused=paused, health=health.to_dict())
+               next_tick_at=None, paused=paused, health=health.to_dict(),
+               last_keepalive=runtime.get("last_keepalive"),
+               last_keepalive_result=(runtime.get("portal") or {}).get("detail"))
 
     store = JsonSubmissionStore(paths.submissions_json)
     approval_cfg = ApprovalConfig.from_dict(config.approval)
@@ -266,6 +276,8 @@ def run_tick(paths: DataPaths, config: Config, *, cdp_url: str, notifier, log,
         "last_tick_at": now.isoformat(timespec="seconds"),
         "next_tick_at": None,
         "driving_chrome": driving_chrome,
+        "last_keepalive": runtime.get("last_keepalive"),
+        "last_keepalive_result": (runtime.get("portal") or {}).get("detail"),
         "health": health.to_dict(),
         "messages": messages[-12:],
     }
