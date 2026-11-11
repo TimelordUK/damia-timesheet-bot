@@ -14,6 +14,7 @@ The bot is passive: it reports state, it never sends and never submits.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from textual.app import App, ComposeResult
@@ -21,6 +22,7 @@ from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, Ta
 
 from ..adapters.state.csv_cache import CsvWeekCache
 from ..adapters.state.submission_store import JsonSubmissionStore
+from ..adapters.timesheet.damia_playwright import DEFAULT_CDP_URL
 from ..core.config import Config
 from ..core.hydrate import build_view
 from ..core.paths import DataPaths
@@ -60,6 +62,29 @@ def compute_view(paths: DataPaths) -> dict | None:
     return persisted
 
 
+def loop_is_live(bot: dict | None, now: datetime) -> bool:
+    """Is a poll loop actually behind this bot block, or is it left over from a previous session?
+    Past its promised next tick means gone; mid-tick there is no promise, so go by the tick's age,
+    generously, since a tick that walks the portal can run for minutes."""
+    if not bot or not bot.get("last_tick_at"):
+        return False
+    if bot.get("next_tick_at"):
+        return now <= datetime.fromisoformat(bot["next_tick_at"]) + timedelta(seconds=90)
+    return now - datetime.fromisoformat(bot["last_tick_at"]) <= timedelta(minutes=15)
+
+
+def merged_health(bot: dict | None, live: dict | None, *, loop_live: bool) -> dict:
+    """What to show: the TUI's own checks win, the loop's fill in only while the loop is alive
+    (a dead loop's health is the stale report this exists to avoid). A missing key = not known."""
+    return {**((bot or {}).get("health", {}) if loop_live else {}), **(live or {})}
+
+
+def status_mark(sub: dict | None, down: str = "DOWN") -> str:
+    if not sub:
+        return "[dim]?[/dim]"
+    return "[green]OK[/green]" if sub.get("ok") else f"[red]{down}[/red]"
+
+
 class DamiaTUI(App):
     TITLE = "Damia timesheet bot"
     SUB_TITLE = "state board · never sends · never submits"
@@ -82,11 +107,14 @@ class DamiaTUI(App):
 
     # How often to reload the JSON so the board tracks the poll loop without pressing 'r'.
     REFRESH_SECONDS = 3.0
+    # How often the board checks Outlook + Chrome for itself, so it is right with no loop running.
+    HEALTH_SECONDS = 30.0
 
     def __init__(self, data_dir: str | None = None) -> None:
         super().__init__()
         self.paths = DataPaths.resolve(data_dir)
         self.reveal_money = False
+        self.live_health: dict | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -107,6 +135,20 @@ class DamiaTUI(App):
         table.add_columns("Week", "State", "Portal", "Days")
         self.refresh_view()
         self.set_interval(self.REFRESH_SECONDS, self.refresh_view)  # live-track the poll loop
+        self.check_health()
+        self.set_interval(self.HEALTH_SECONDS, self.check_health)
+
+    def check_health(self) -> None:
+        self.run_worker(self._probe_health, thread=True, exclusive=True, group="health")
+
+    def _probe_health(self) -> None:
+        from ..poll import probe_local
+        health = probe_local(DEFAULT_CDP_URL)
+        self.call_from_thread(self._set_live_health, health)
+
+    def _set_live_health(self, health: dict) -> None:
+        self.live_health = health
+        self.refresh_view()
 
     # --- actions ---------------------------------------------------------------
 
@@ -158,25 +200,33 @@ class DamiaTUI(App):
         """The 'Ready to work?' header: is the poll loop live, and are Outlook + Chrome up."""
         bot = view.get("bot")
         widget = self.query_one("#bot-status", Static)
-        if not bot:
-            widget.update("[dim]Bot not running — start [b]damia-bot poll[/b]. Showing last known "
-                          "state.[/dim]")
+        live = loop_is_live(bot, datetime.now())
+        h = merged_health(bot, self.live_health, loop_live=live)
+        portal = h.get("portal")
+        marks = (f"Outlook {status_mark(h.get('outlook'))}  Chrome {status_mark(h.get('chrome_cdp'))}"
+                 f"  Damia {status_mark(portal, 'LOGGED OUT')}")
+        if portal and not portal.get("ok"):
+            marks += f"\n[red]{portal.get('error')}[/red]"
+        if not live:
+            widget.update(f"[b]Bot[/b] [yellow b]not running[/yellow b]   {marks}\n"
+                          f"[dim]start [b]damia-bot poll[/b]  ·  showing last known weeks[/dim]")
             return
-        h = bot.get("health", {})
-
-        def mark(sub: str) -> str:
-            s = h.get(sub, {})
-            return f"[green]OK[/green]" if s.get("ok") else "[red]DOWN[/red]"
-
-        ready = "[green b]READY[/green b]" if h.get("can_work_fully") else "[yellow b]DEGRADED[/yellow b]"
+        fully = all((h.get(k) or {}).get("ok") for k in ("outlook", "chrome_cdp")) \
+            and (portal is None or portal.get("ok"))
+        ready = "[green b]READY[/green b]" if fully else "[yellow b]DEGRADED[/yellow b]"
         paused = "  [yellow b]⏸ PAUSED[/yellow b]" if bot.get("paused") else ""
         last = bot.get("last_tick_at", "?")
         nxt = bot.get("next_tick_at")
+        ping = bot.get("last_keepalive")
+        ping_result = bot.get("last_keepalive_result") or "?"
+        if "NOT reset" in ping_result or "popup will fire" in ping_result:
+            ping_result = f"[yellow b]{ping_result}[/yellow b]"
         widget.update(
-            f"[b]Bot[/b] tick {bot.get('tick_seq', '?')} · {ready}{paused}   "
-            f"Outlook {mark('outlook')}  Chrome {mark('chrome_cdp')}\n"
+            f"[b]Bot[/b] tick {bot.get('tick_seq', '?')} · {ready}{paused}   {marks}\n"
             f"[dim]last tick {last}{('  ·  next ~' + nxt) if nxt else ''}  ·  "
             f"never sends · never submits[/dim]"
+            + (f"\n[dim]Damia ping {ping[11:16]} → {ping_result}[/dim]" if ping else
+               "\n[dim]Damia ping: none yet[/dim]")
         )
 
     def _render_now(self, view: dict) -> None:

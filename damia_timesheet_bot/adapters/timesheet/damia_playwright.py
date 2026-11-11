@@ -21,6 +21,10 @@ from ...core.models import Day, DayKind, Week
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 DAMIA_URL_FRAGMENT = "damia.timesheetportal.com"
+# keep_alive reloads the page once it is this old (Damia's uncancellable popup fires at 55 min)
+# and nobody has touched it for this long. Pinging every ~6 min gives two chances before 55.
+KEEPALIVE_RELOAD_AFTER_MINUTES = 40
+KEEPALIVE_IDLE_SECONDS = 300
 
 # Selectors that are NOT parameterized by the per-week timesheet ID.
 SEL_DATE_CAPTION     = "#MainContent_lblDateCaption"
@@ -111,7 +115,9 @@ class DamiaTimesheetDriver:
 
     # ---- lifecycle --------------------------------------------------------
 
-    def attach(self) -> DamiaTimesheetDriver:
+    def attach(self, *, require_timesheet: bool = True) -> DamiaTimesheetDriver:
+        """Connect to the Damia tab. `require_timesheet=False` stops there, for session checks
+        that must work on a login page, where there is no timesheet to discover."""
         try:
             requests.get(f"{self.cdp_url}/json/version", timeout=2).raise_for_status()
         except Exception as e:
@@ -130,6 +136,8 @@ class DamiaTimesheetDriver:
 
         self._page = self._find_damia_page()
         self._page.on("dialog", lambda d: None)
+        if not require_timesheet:
+            return self
         try:
             self._page.wait_for_load_state("domcontentloaded", timeout=10000)
             self._page.wait_for_selector("[id^='tsEntriesWrapper_']", timeout=10000)
@@ -158,8 +166,8 @@ class DamiaTimesheetDriver:
         self.timesheet_id = None
 
     @contextmanager
-    def attached(self) -> Iterator[DamiaTimesheetDriver]:
-        self.attach()
+    def attached(self, *, require_timesheet: bool = True) -> Iterator[DamiaTimesheetDriver]:
+        self.attach(require_timesheet=require_timesheet)
         try:
             yield self
         finally:
@@ -181,6 +189,72 @@ class DamiaTimesheetDriver:
             f"No tab found with URL containing {DAMIA_URL_FRAGMENT!r}. "
             "Open the Damia timesheet tab in the CDP-launched Chrome and retry."
         )
+
+    # ---- session ----------------------------------------------------------
+
+    def keep_alive(self) -> tuple[bool, str]:
+        """Renew the portal session and report whether it is still logged in, with a note on what
+        came back. Issues a background same-origin GET from inside the tab, so the session cookie
+        applies and the DOM is untouched. Logged-out is recognised positively, by a password field
+        in the live page (already bounced to the login screen) or in the response (the next
+        navigation would bounce).
+
+        The GET alone isn't enough. Damia's page arms a 55-minute "session has timed out" popup at
+        load, whatever the server thinks. refreshTimeout() restarts the timer it can see, but the
+        page arms one at load that nothing can cancel (seen live 2026-11-09: the popup fired at
+        exactly 55 min despite a refreshTimeout every 6 min). Only a page load clears it, so once
+        the page is old and nobody is using it, we reload it, and a popup that is already up over
+        a live server session is cleared the same way. A reload throws away unsaved typing and
+        lands on the default week, hence the idle check: listeners installed on the first ping
+        record input, and until then the page counts as in use."""
+        result = self.page.evaluate(
+            """async (idleMs) => {
+              if (!window.__dtbLastInput) {
+                window.__dtbLastInput = Date.now();
+                for (const e of ['keydown', 'mousedown', 'mousemove', 'wheel', 'input', 'touchstart']) {
+                  addEventListener(e, () => { window.__dtbLastInput = Date.now(); },
+                                   {capture: true, passive: true});
+                }
+              }
+              if (document.querySelector('input[type=password]')) return {live_login: true};
+              const popup = document.body.innerText.includes('session has timed out');
+              const r = await fetch(location.href, {credentials: 'include', cache: 'no-store'});
+              const login = /<input[^>]+type=["']?password/i.test(await r.text());
+              const has_timer = typeof window.refreshTimeout === 'function';
+              if (r.status === 200 && !login && has_timer) window.refreshTimeout();
+              return {status: r.status, login, has_timer, popup,
+                      age_ms: Date.now() - performance.timeOrigin,
+                      idle_ms: Date.now() - window.__dtbLastInput};
+            }""",
+            KEEPALIVE_IDLE_SECONDS * 1000,
+        )
+        if result.get("live_login"):
+            return False, "page is on the login screen"
+        if result.get("login"):
+            return False, f"HTTP {result.get('status')} but the server answered with the login page"
+        if result.get("status") != 200:
+            raise RuntimeError(f"portal keep-alive got HTTP {result.get('status')}")
+        age_min = result["age_ms"] / 60000
+        if result.get("popup"):
+            self._reload_page()
+            return True, (f"HTTP 200, server session alive but the page showed its stale timed-out "
+                          f"popup — reloaded the page ({age_min:.0f} min old)")
+        if age_min >= KEEPALIVE_RELOAD_AFTER_MINUTES:
+            if result["idle_ms"] >= KEEPALIVE_IDLE_SECONDS * 1000:
+                self._reload_page()
+                return True, f"HTTP 200, reloaded the idle page ({age_min:.0f} min old) before its 55-min popup"
+            return True, (f"HTTP 200, page {age_min:.0f} min old — waiting for {KEEPALIVE_IDLE_SECONDS // 60} "
+                          f"min without input to reload it, or the 55-min popup will fire")
+        # Without refreshTimeout the server session lives but the page's own timer still fires.
+        timer = ("page timer reset" if result.get("has_timer")
+                 else "page timer NOT reset (no refreshTimeout on the page)")
+        return True, f"HTTP 200, {timer} (page {age_min:.0f} min old)"
+
+    def _reload_page(self) -> None:
+        """A fresh GET of the tab's URL, which is what F5 does minus the form-resubmit prompt a
+        postback page would raise."""
+        self.page.goto(self.page.url, wait_until="domcontentloaded", timeout=30000)
+        self.timesheet_id = None  # every page load issues fresh ids
 
     # ---- timesheet-id discovery -------------------------------------------
 

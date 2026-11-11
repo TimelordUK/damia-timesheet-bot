@@ -43,6 +43,7 @@ class HealthReport:
     outlook: SubsystemHealth
     chrome_cdp: SubsystemHealth
     render: SubsystemHealth
+    portal: SubsystemHealth | None = None   # logged into Damia? None = not checked (Chrome down/paused)
 
     @property
     def can_sense_email(self) -> bool:
@@ -50,19 +51,20 @@ class HealthReport:
 
     @property
     def can_drive_portal(self) -> bool:
-        return self.chrome_cdp.ok
+        return self.chrome_cdp.ok and (self.portal is None or self.portal.ok)
 
     @property
     def can_work_fully(self) -> bool:
-        """Fully operational needs BOTH: Outlook to sense sends/replies, Chrome to fill/draft/
-        attach/render. Either down and the loop degrades to what the other allows."""
-        return self.outlook.ok and self.chrome_cdp.ok
+        """Fully operational needs BOTH: Outlook to sense sends/replies, a logged-in Chrome to
+        fill/draft/attach/render. Either down and the loop degrades to what the other allows."""
+        return self.outlook.ok and self.can_drive_portal
 
     def to_dict(self) -> dict:
         return {
             "outlook": self.outlook.to_dict(),
             "chrome_cdp": self.chrome_cdp.to_dict(),
             "render": self.render.to_dict(),
+            "portal": self.portal.to_dict() if self.portal else None,
             "can_work_fully": self.can_work_fully,
         }
 

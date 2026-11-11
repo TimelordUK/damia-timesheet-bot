@@ -1,7 +1,7 @@
 """damia-bot CLI. Draft-only, never submits.
 
 Commands:
-  hydrate   Walk the portal back to the job start; rebuild cache/ (CSV + PDFs + attachments)
+  hydrate   Walk the portal back to the last settled week (--full: to the job start); update cache/
             and cache/view.json. The portal is the source of truth; the cache is disposable.
   view      Print the current cache/view.json.
 """
@@ -63,6 +63,7 @@ def cmd_hydrate(args: argparse.Namespace) -> int:
             download_pdf=not args.no_download,
             pull_attachments=not args.no_attachments,
             max_weeks=args.max_weeks,
+            known=None if args.full else CsvWeekCache(paths.csv_path).read(),
         )
 
     CsvWeekCache(paths.csv_path).write(records)
@@ -600,9 +601,12 @@ def main(argv: list[str] | None = None) -> int:
     i = sub.add_parser("init", help="Create the data root + config.yml template, then exit.")
     i.set_defaults(func=cmd_init)
 
-    h = sub.add_parser("hydrate", help="Rebuild the cache + view.json by walking the portal.")
+    h = sub.add_parser("hydrate", help="Update the cache + view.json by walking the portal back "
+                                       "as far as the last settled week.")
     h.add_argument("--cdp-url", default=DEFAULT_CDP_URL)
-    h.add_argument("--max-weeks", type=int, default=60)
+    h.add_argument("--full", action="store_true",
+                   help="Ignore the cache and walk all the way back to the job start.")
+    h.add_argument("--max-weeks", type=int, default=260)
     h.add_argument("--no-download", action="store_true", help="Skip PDF downloads.")
     h.add_argument("--no-attachments", action="store_true",
                    help="Skip pulling approval screenshots.")
